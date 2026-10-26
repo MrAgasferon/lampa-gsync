@@ -337,6 +337,12 @@
       } catch (e) { continue; }
 
       if (p.status === 200 && p.json.access_token) {
+        if (String(p.json.scope || '').indexOf('/auth/drive.file') < 0) {
+          try { await formPost(URL_REVOKE, { token: p.json.refresh_token || p.json.access_token }); } catch (e) {}
+          status('Не выдан доступ к Google Диску. Начните вход заново и отметьте пункт про файлы Google Диска.');
+          log('Вход отклонён: не выдан scope drive.file');
+          return;
+        }
         saveAuth(p.json);
         Lampa.Modal.close(); backToSettings();
         noty('Вход выполнен: ' + (auth().email || 'Google'));
@@ -396,6 +402,12 @@
     }
     var text = await res.text(), json = null;
     try { json = text ? JSON.parse(text) : null; } catch (e) {}
+    if (res.status === 403 && /insufficient authentication scopes/i.test(text)) {
+      localStorage.removeItem('gsync_auth');
+      var se = new Error('нет доступа к Google Диску — войдите заново и отметьте пункт про файлы Диска');
+      se.status = 403;
+      throw se;
+    }
     if (!res.ok) {
       var er = new Error((json && json.error && json.error.message) || ('HTTP ' + res.status));
       er.status = res.status;
