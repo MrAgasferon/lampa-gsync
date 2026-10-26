@@ -13,8 +13,8 @@
    * Конфигурация
    * ============================================================ */
   var CFG = {
-    CLIENT_ID: 'PASTE_CLIENT_ID.apps.googleusercontent.com',
-    CLIENT_SECRET: 'PASTE_CLIENT_SECRET',
+    CLIENT_ID: '535155307066-9fe6e9hc0gp0gkmkd22uomtt8surte2j.apps.googleusercontent.com',
+    CLIENT_SECRET: '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',
     SCOPE: 'openid email https://www.googleapis.com/auth/drive.file',
     FILE_NAME: 'Lampa Sync',
     APP_PROP: 'lampa_gsync',
