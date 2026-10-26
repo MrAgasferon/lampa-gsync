@@ -829,30 +829,156 @@
     });
   }
 
-  var GROUP_TITLES = { settings_ui: 'Интерфейс', settings_sources: 'Источники', plugin_settings: 'Плагины' };
+  /* ---------- Исключения: группировка и описания ключей ---------- */
 
-  function openExclusions(focusKey) {
+  // Описания известных ключей Lampa. Для ключей сторонних плагинов описания нет —
+  // показывается сам ключ и текущее значение.
+  var KEY_INFO = {
+    language: 'Язык интерфейса',
+    source: 'Источник каталога по умолчанию',
+    start_page: 'Стартовая страница',
+    interface_size: 'Размер интерфейса',
+    background: 'Фон из постеров',
+    background_type: 'Тип фона',
+    animation: 'Анимации интерфейса',
+    glass_style: 'Эффект стекла',
+    mask: 'Затемнение краёв',
+    light_version: 'Облегчённая версия интерфейса',
+    card_interfice_type: 'Вид карточки фильма',
+    screensaver: 'Заставка при бездействии',
+    screensaver_type: 'Тип заставки',
+    keyboard_type: 'Тип экранной клавиатуры',
+    navigation_type: 'Тип навигации (пульт / мышь)',
+    player: 'Плеер для онлайн-видео',
+    player_torrent: 'Плеер для торрентов',
+    player_iptv: 'Плеер для IPTV',
+    torrserver_url: 'Адрес TorrServer',
+    torrserver_url_two: 'Запасной адрес TorrServer',
+    torrserver_use_link: 'Какой адрес TorrServer использовать',
+    parser_use: 'Использовать парсер торрентов',
+    parser_type: 'Тип парсера (Jackett / Prowlarr)',
+    jackett_url: 'Адрес Jackett',
+    jackett_key: 'API-ключ Jackett',
+    video_quality_default: 'Качество видео по умолчанию',
+    subtitles_size: 'Размер субтитров',
+    subtitles_stroke: 'Обводка субтитров',
+    proxy_tmdb: 'Прокси для TMDB',
+    tmdb_lang: 'Язык данных TMDB'
+  };
+
+  var SECTION_INFO = {
+    device: { title: 'Привязано к устройству', descr: 'Плеер, TorrServer, размер интерфейса, прокси — по умолчанию не синхронизируется' },
+    settings_ui: { title: 'Интерфейс', descr: 'Язык, оформление, вид карточек' },
+    settings_sources: { title: 'Источники и парсеры', descr: 'Источник каталога, парсеры, балансеры' },
+    other: { title: 'Прочее', descr: 'Ключи, которые не удалось отнести к плагину' }
+  };
+
+  function keyPrefix(k) { return String(k).split(/[_\-.]/)[0].toLowerCase(); }
+
+  // Пытаемся сопоставить префикс ключа с установленным плагином (по URL или имени)
+  function pluginLabel(prefix) {
+    var list = lsGet('plugins', []) || [];
+    if (!Array.isArray(list) || prefix.length < 3) return '';
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i] || {}, url = String(p.url || p || '').toLowerCase(), name = String(p.name || '');
+      if (url.indexOf(prefix) >= 0 || name.toLowerCase().indexOf(prefix) >= 0) {
+        return name || url.split('/').pop().replace(/\?.*$/, '');
+      }
+    }
+    return '';
+  }
+
+  function exclusionSections() {
     var keys = allKeys().filter(function (k) { return !isHardDenied(k) && !claimedByCollection(k); }).sort();
-    if (!keys.length) return noty('Нет ключей для настройки');
+    var sec = {}, prefixes = {};
+    function add(id, k) { (sec[id] = sec[id] || []).push(k); }
+
+    keys.forEach(function (k) {
+      if (isDefaultDenied(k)) return add('device', k);
+      var cat = kvCategory(k);
+      if (cat === 'settings_ui' || cat === 'settings_sources') return add(cat, k);
+      var p = keyPrefix(k);
+      (prefixes[p] = prefixes[p] || []).push(k);
+    });
+
+    // Ключи плагинов: группа по префиксу, если ключей с ним ≥ 2, иначе — «Прочее»
+    Object.keys(prefixes).sort().forEach(function (p) {
+      if (prefixes[p].length < 2) return prefixes[p].forEach(function (k) { add('other', k); });
+      var label = pluginLabel(p);
+      SECTION_INFO['p:' + p] = {
+        title: 'Плагин: ' + (label || p),
+        descr: label ? 'Ключи с префиксом «' + p + '»' : 'Ключи с префиксом «' + p + '» — плагин не определён'
+      };
+      sec['p:' + p] = prefixes[p];
+    });
+
+    var order = ['device', 'settings_ui', 'settings_sources'];
+    Object.keys(sec).forEach(function (id) { if (/^p:/.test(id)) order.push(id); });
+    order.push('other');
+    return order.filter(function (id) { return sec[id] && sec[id].length; })
+      .map(function (id) { return { id: id, keys: sec[id], info: SECTION_INFO[id] }; });
+  }
+
+  function valuePreview(k) {
+    var v = localStorage.getItem(k);
+    if (v === null) return '';
+    v = v.replace(/^"|"$/g, '');
+    if (v.length > 40) v = v.slice(0, 40) + '…';
+    return v === '' ? '(пусто)' : v;
+  }
+
+  function setLocal(k, wantLocal) {
+    var o = overrides();
+    if (wantLocal === isDefaultDenied(k)) delete o[k];
+    else o[k] = wantLocal ? 'deny' : 'allow';
+    lsSet('gsync_overrides', o);
+  }
+
+  function openExclusions(focusId) {
+    var sections = exclusionSections();
+    if (!sections.length) return noty('Нет ключей для настройки');
     Lampa.Select.show({
-      title: 'Исключения (✗ — только на этом устройстве)',
-      items: keys.map(function (k) {
-        var loc = isLocalOnly(k);
+      title: 'Исключения',
+      items: sections.map(function (s) {
+        var loc = s.keys.filter(isLocalOnly).length;
         return {
-          title: (loc ? '✗ ' : '✓ ') + k,
-          subtitle: (loc ? 'локально' : 'синхронизируется') + ' · ' + (GROUP_TITLES[kvCategory(k)] || ''),
-          key: k, selected: k === focusKey
+          title: s.info.title,
+          subtitle: s.keys.length + ' кл. · ' + (loc === 0 ? 'все синхронизируются' : loc === s.keys.length ? 'все локально' : loc + ' локально') + ' — ' + s.info.descr,
+          section: s, selected: s.id === focusId
         };
       }),
-      onSelect: function (it) {
-        var o = overrides(), wantLocal = !isLocalOnly(it.key);
-        if (wantLocal === isDefaultDenied(it.key)) delete o[it.key];
-        else o[it.key] = wantLocal ? 'deny' : 'allow';
-        lsSet('gsync_overrides', o);
-        markCfgChanged();
-        openExclusions(it.key);
-      },
+      onSelect: function (it) { openSection(it.section.id); },
       onBack: backToSettings
+    });
+  }
+
+  function openSection(id, focusKey) {
+    var s = exclusionSections().filter(function (x) { return x.id === id; })[0];
+    if (!s) return openExclusions();
+    var allLocal = s.keys.every(isLocalOnly);
+    var items = [{
+      title: allLocal ? '✓ Синхронизировать всю группу' : '✗ Оставить всю группу на этом устройстве',
+      subtitle: 'Применить ко всем ' + s.keys.length + ' ключам ниже',
+      all: true
+    }];
+    s.keys.forEach(function (k) {
+      var loc = isLocalOnly(k), info = KEY_INFO[k];
+      items.push({
+        title: (loc ? '✗ ' : '✓ ') + (info || k),
+        subtitle: (info ? k + ' · ' : '') + 'значение: ' + valuePreview(k) + ' · ' + (loc ? 'только здесь' : 'синхронизируется'),
+        key: k, selected: k === focusKey
+      });
+    });
+    Lampa.Select.show({
+      title: s.info.title + ' (✗ — только на этом устройстве)',
+      items: items,
+      onSelect: function (it) {
+        if (it.all) s.keys.forEach(function (k) { setLocal(k, !allLocal); });
+        else setLocal(it.key, !isLocalOnly(it.key));
+        markCfgChanged();
+        openSection(id, it.key);
+      },
+      onBack: function () { openExclusions(id); }
     });
   }
 
@@ -875,7 +1001,7 @@
   function addSettings() {
     if (!Lampa.SettingsApi) return;
     var C = 'gsync';
-    Lampa.SettingsApi.addComponent({ component: C, name: 'Синхронизация', icon: ICON });
+    Lampa.SettingsApi.addComponent({ component: C, name: 'Lampa GSync', icon: ICON });
 
     function title(name, text) {
       Lampa.SettingsApi.addParam({ component: C, param: { name: 'gsync_title_' + name, type: 'title' }, field: { name: text } });
