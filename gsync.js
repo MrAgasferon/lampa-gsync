@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.1.0
+ * Версия 0.2.0
  */
 (function () {
   'use strict';
@@ -25,6 +25,9 @@
     TOMBSTONE_TTL_MS: 30 * 24 * 3600 * 1000, // tombstones старше 30 дней удаляются при сжатии
     COMPACT_MIN_ROWS: 500,
     APPEND_BATCH: 2000,
+    LOCK_MS: 2 * 60 * 1000,                  // блокировка сжатия считается брошенной через 2 минуты
+    CLOCK_MIN_SKEW_MS: 5 * 60 * 1000,        // меньшие расхождения часов не корректируются
+    TOUCH_TTL_MS: 60 * 24 * 3600 * 1000,
     QR_LIB: 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'
   };
 
@@ -96,6 +99,38 @@
     lsSet('gsync_log', a.slice(-30));
   }
 
+  function authError(text) { var e = new Error(text); e.auth = true; return e; }
+  var SESSION = Math.random().toString(36).slice(2, 8);
+
+  /* ---------- Время: поправка часов устройства по серверу Google ---------- */
+  var clockOffset = Number(lsGet('gsync_clock', 0)) || 0, clockKnown = false;
+  function now() { return Date.now() + clockOffset; }
+  function setClock(serverMs, localMs) {
+    if (!isFinite(serverMs) || !isFinite(localMs)) return;
+    var o = serverMs - localMs;
+    if (Math.abs(o) > 365 * 24 * 3600 * 1000) return;
+    if (Math.abs(o) < CFG.CLOCK_MIN_SKEW_MS) o = 0;
+    if (o !== clockOffset) log('Поправка часов устройства: ' + Math.round(o / 1000) + ' с');
+    clockOffset = o; clockKnown = true;
+    lsSet('gsync_clock', o);
+  }
+
+  /* ---------- Журнал изменений ключей (время правки, а не время синхронизации) ---------- */
+  function touch(k) { var m = lsGet('gsync_touch', {}) || {}; m[k] = now(); lsSet('gsync_touch', m); }
+  function pruneTouches() {
+    var m = lsGet('gsync_touch', {}) || {}, T = now();
+    Object.keys(m).forEach(function (k) { if (T - m[k] > CFG.TOUCH_TTL_MS) delete m[k]; });
+    lsSet('gsync_touch', m);
+  }
+
+  /* ---------- CUB ---------- */
+  var CUB_GROUPS = ['bookmarks', 'progress'];
+  function cubActive() {
+    var a = lsGet('account', null);
+    return !!(a && typeof a === 'object' && a.token) && boolSetting('account_use', true);
+  }
+  function cubYield() { return boolSetting('gsync_cub_yield', true) && cubActive(); }
+
   /* ============================================================
    * Группы синхронизации (один лист на группу)
    * ============================================================ */
@@ -124,6 +159,7 @@
     title: 'Закладки и история', descr: 'favorite: закладки, «позже», история',
     header: ['item_id', 'list', 'card_id', 'type', 'title', 'json', 'updated_at', 'deleted', 'device'],
     claim: function (k) { return k === 'favorite'; },
+    keyOf: function () { return 'favorite'; },
     read: function () {
       var fav = lsGet('favorite', {}) || {}, cards = {}, out = [];
       (fav.card || []).forEach(function (c) { if (c && c.id !== undefined) cards[c.id] = c; });
@@ -159,6 +195,7 @@
       kind: 'col', order: null, cached: false,
       header: ['item_id', 'storage_key', 'item', 'json', 'updated_at', 'deleted', 'device'],
       cols: function (k, sub, x) { return [k, x !== null && typeof x === 'object' ? (x.name || x.url || sub) : String(x).slice(0, 200)]; },
+      keyOf: function (id) { return id.slice(0, id.indexOf('|')); },
       read: function () {
         var out = [];
         keysMatching(g.claim).forEach(function (k) {
@@ -204,6 +241,7 @@
       id: id, sheet: id, kind: 'kv', order: null, cached: false, title: title, descr: descr,
       header: ['key', 'value', 'updated_at', 'deleted', 'device'],
       claim: function () { return false; },
+      keyOf: function (id) { return id; },
       read: function () {
         return allKeys()
           .filter(function (k) { return kvCategory(k) === id && !isLocalOnly(k); })
@@ -235,8 +273,11 @@
     kvGroup('settings_ui', 'Настройки интерфейса', 'Язык, оформление, вид карточек'),
     kvGroup('settings_sources', 'Источники и парсеры', 'Источник по умолчанию, парсеры, балансеры'),
     containerGroup({
-      id: 'plugins', sheet: 'plugins', order: 'asc', cached: true, title: 'Список плагинов', descr: 'Установленные плагины',
-      claim: function (k) { return k === 'plugins'; }
+      id: 'plugins', sheet: 'plugins', order: 'asc', cached: true, title: 'Список плагинов',
+      descr: 'Установленные плагины. Новые с других устройств — с выбором галочками',
+      claim: function (k) { return k === 'plugins'; },
+      confirm: true,                                                          // добавления/удаления — через диалог
+      skip: function () { return lsGet('gsync_plugins_declined', {}) || {}; } // отклонённые на этом устройстве
     }),
     kvGroup('plugin_settings', 'Настройки плагинов', 'Всё остальное, кроме исключений')
   ];
@@ -275,14 +316,14 @@
 
   async function accessToken() {
     var a = auth();
-    if (!a || !a.refresh_token) throw new Error('не выполнен вход');
+    if (!a || !a.refresh_token) throw authError('не выполнен вход в Google');
     if (a.access_token && Date.now() < a.expires_at - 60000) return a.access_token;
     var r = await formPost(URL_TOKEN, {
       client_id: CFG.CLIENT_ID, client_secret: CFG.CLIENT_SECRET,
       refresh_token: a.refresh_token, grant_type: 'refresh_token'
     });
     if (r.status === 200 && r.json.access_token) { saveAuth(r.json); return r.json.access_token; }
-    if (r.json.error === 'invalid_grant') { localStorage.removeItem('gsync_auth'); throw new Error('доступ отозван — войдите заново'); }
+    if (r.json.error === 'invalid_grant') { localStorage.removeItem('gsync_auth'); throw authError('доступ к Google отозван или истёк — войдите заново'); }
     throw new Error('не удалось обновить токен: ' + (r.json.error || r.status));
   }
 
@@ -347,6 +388,8 @@
         Lampa.Modal.close(); backToSettings();
         noty('Вход выполнен: ' + (auth().email || 'Google'));
         log('Вход: ' + (auth().email || ''));
+        authNotified = false;
+        try { sessionStorage.removeItem('gsync_reloaded'); } catch (e) {} // чтобы первая синхронизация могла применить закладки
         syncAll({ startup: true });
         return;
       }
@@ -372,6 +415,7 @@
     localStorage.removeItem('gsync_auth');
     localStorage.removeItem('gsync_sheet_id');
     localStorage.removeItem('gsync_cfg_t');
+    localStorage.removeItem('gsync_plugins_declined');
     resetSyncState();
     log('Выход из аккаунта');
     noty('Вы вышли из аккаунта Google');
@@ -400,11 +444,15 @@
       await sleep(2000 * Math.pow(2, attempt));
       return api(method, url, body, attempt + 1);
     }
+    if (!clockKnown && res.headers) {
+      var dh = res.headers.get('date');
+      if (dh) setClock(Date.parse(dh), Date.now());
+    }
     var text = await res.text(), json = null;
     try { json = text ? JSON.parse(text) : null; } catch (e) {}
     if (res.status === 403 && /insufficient authentication scopes/i.test(text)) {
       localStorage.removeItem('gsync_auth');
-      var se = new Error('нет доступа к Google Диску — войдите заново и отметьте пункт про файлы Диска');
+      var se = authError('нет доступа к Google Диску — войдите заново и отметьте пункт про файлы Диска');
       se.status = 403;
       throw se;
     }
@@ -431,12 +479,19 @@
     }
   }
 
-  async function rewriteSheet(id, sheet, rows, cols) {
-    await api('POST', valuesUrl(id, sheet + '!A2:' + cols) + ':clear', {});
-    if (rows.length) await api('PUT', valuesUrl(id, sheet + '!A2') + '?valueInputOption=RAW', { values: rows });
+  function putRange(id, range, rows) { return api('PUT', valuesUrl(id, range) + '?valueInputOption=RAW', { values: rows }); }
+  function clearRange(id, range) { return api('POST', valuesUrl(id, range) + ':clear', {}); }
+
+  function pad(row, n) { var r = (row || []).slice(0, n); while (r.length < n) r.push(''); return r; }
+
+  // Перезапись без промежуточного пустого листа: сначала новые строки поверх старых, потом очистка хвоста
+  async function rewriteSheet(id, sheet, rows, cols, oldCount) {
+    if (rows.length) await putRange(id, sheet + '!A2', rows);
+    if (oldCount > rows.length) await clearRange(id, sheet + '!A' + (rows.length + 2) + ':' + cols + (oldCount + 1));
   }
 
   var META_HEADER = ['key', 'value'];
+  var SVC_HEADER = ['service', 'value'];
   var SNAP_HEADER = ['snapshot_id', 'chunk_no', 'chunks', 'data', 'created_at', 'device'];
   function headerFor(sheet) {
     if (sheet === '_meta') return META_HEADER;
@@ -450,30 +505,73 @@
     return (meta.sheets || []).map(function (s) { return s.properties.title; });
   }
 
-  async function ensureSpreadsheet() {
-    var id = lsGet('gsync_sheet_id', '');
-    if (id) {
-      try { return { id: id, titles: await sheetTitles(id) }; }
-      catch (e) {
-        if (e.status !== 404 && e.status !== 403) throw e;
-        localStorage.removeItem('gsync_sheet_id');
-        resetSyncState();
-        log('Таблица не найдена — поиск/создание заново');
+  /* ---------- Служебные ячейки _meta (колонки D:E) ---------- */
+  // D2:E2 — блокировка сжатия, D3+:E3+ — горизонт очистки удалений по группам
+  function svcRow(key) {
+    if (key === 'compact_lock') return 2;
+    var g = key.replace(/^purged_/, '');
+    return 3 + GROUPS.indexOf(GROUP_BY_ID[g]);
+  }
+  function writeSvc(id, key, value) {
+    var r = svcRow(key);
+    return putRange(id, '_meta!D' + r + ':E' + r, [[key, String(value)]]);
+  }
+  async function readSvc(id) {
+    var rows = (await batchGet(id, ['_meta!D2:E']))[0], svc = {};
+    rows.forEach(function (r) { if (r[0]) svc[r[0]] = r[1]; });
+    return svc;
+  }
+
+  /* ---------- Поиск таблицы, дубликаты, корзина ---------- */
+  async function findTables() {
+    var q = encodeURIComponent("appProperties has { key='" + CFG.APP_PROP + "' and value='1' } and trashed=false");
+    var list = await api('GET', DRIVE + '?q=' + q + '&spaces=drive&orderBy=createdTime&fields=files(id,name,createdTime)');
+    return list.files || [];
+  }
+
+  // Переносит все строки групп и снимков из таблицы-дубликата в основную и отправляет дубликат в корзину
+  async function mergeInto(main, dup) {
+    var titles = await sheetTitles(dup);
+    var sheets = titles.filter(function (t) { return GROUP_BY_ID[t] || t === 'snapshots'; });
+    if (sheets.length) {
+      var mainSs = { id: main, titles: await sheetTitles(main) };
+      await ensureSheets(mainSs, sheets);
+      var data = await batchGet(dup, sheets.map(function (t) { return t + '!A2:Z'; }));
+      for (var i = 0; i < sheets.length; i++) {
+        var n = headerFor(sheets[i]).length;
+        var rows = data[i].filter(function (r) { return r[0] !== undefined && r[0] !== ''; }).map(function (r) { return pad(r, n); });
+        if (rows.length) await appendRows(main, sheets[i], rows);
       }
     }
-    var q = encodeURIComponent("appProperties has { key='" + CFG.APP_PROP + "' and value='1' } and trashed=false");
-    var list = await api('GET', DRIVE + '?q=' + q + '&spaces=drive&orderBy=createdTime&fields=files(id,name)');
-    if (list.files && list.files.length) {
-      id = list.files[0].id;
+    await api('PATCH', DRIVE + '/' + dup + '?fields=id', { trashed: true });
+  }
+
+  async function ensureSpreadsheet() {
+    var saved = lsGet('gsync_sheet_id', ''), files = await findTables(), id;
+    if (files.length) {
+      id = files[0].id; // основная — самая старая
+      var savedAlive = files.some(function (f) { return f.id === saved; });
+      if (saved && saved !== id) {
+        if (savedAlive) { await mergeInto(id, saved); log('Своя таблица-дубликат объединена с основной'); }
+        else { resetSyncState(); log('Таблица в корзине или удалена — переключение на основную'); }
+      }
+      for (var i = 1; i < files.length; i++) {
+        if (files[i].id === saved) continue;
+        await mergeInto(id, files[i].id);
+        log('Таблица-дубликат «' + files[i].name + '» объединена с основной');
+      }
       lsSet('gsync_sheet_id', id);
-      log('Найдена таблица «' + list.files[0].name + '»');
       return { id: id, titles: await sheetTitles(id) };
     }
+    if (saved) { resetSyncState(); log('Таблица не найдена — создаётся новая'); }
     var created = await api('POST', SHEETS, { properties: { title: CFG.FILE_NAME }, sheets: [sheetSpec('_meta')] });
     id = created.spreadsheetId;
     var props = {}; props[CFG.APP_PROP] = '1';
     await api('PATCH', DRIVE + '/' + id + '?fields=id', { appProperties: props });
-    await api('PUT', valuesUrl(id, '_meta!A1') + '?valueInputOption=RAW', { values: [META_HEADER] });
+    await api('POST', SHEETS + '/' + id + '/values:batchUpdate', {
+      valueInputOption: 'RAW',
+      data: [{ range: '_meta!A1', values: [META_HEADER] }, { range: '_meta!D1', values: [SVC_HEADER] }]
+    });
     lsSet('gsync_sheet_id', id);
     log('Создана таблица «' + CFG.FILE_NAME + '»');
     return { id: id, titles: ['_meta'] };
@@ -482,9 +580,20 @@
   async function ensureSheets(ss, needed) {
     var missing = needed.filter(function (t) { return ss.titles.indexOf(t) < 0; });
     if (!missing.length) return;
-    await api('POST', SHEETS + '/' + ss.id + ':batchUpdate', {
-      requests: missing.map(function (t) { return { addSheet: sheetSpec(t) }; })
-    });
+    var add = function () {
+      return api('POST', SHEETS + '/' + ss.id + ':batchUpdate', {
+        requests: missing.map(function (t) { return { addSheet: sheetSpec(t) }; })
+      });
+    };
+    try { await add(); }
+    catch (e) {
+      if (!/already exists/i.test(msg(e))) throw e;
+      // лист только что создало другое устройство
+      ss.titles = await sheetTitles(ss.id);
+      missing = needed.filter(function (t) { return ss.titles.indexOf(t) < 0; });
+      if (!missing.length) return;
+      await add();
+    }
     await api('POST', SHEETS + '/' + ss.id + '/values:batchUpdate', {
       valueInputOption: 'RAW',
       data: missing.map(function (t) { return { range: t + '!A1', values: [headerFor(t)] }; })
@@ -492,8 +601,18 @@
     ss.titles = ss.titles.concat(missing);
   }
 
+  /* ---------- Серверное время ---------- */
+  // Если в ответах Google нет доступного заголовка Date — один раз за сеанс пишем ячейку и читаем modifiedTime файла
+  async function probeClock(id) {
+    var t0 = Date.now();
+    await putRange(id, '_meta!G1', [[deviceName() + ' ' + t0]]);
+    var t1 = Date.now();
+    var f = await api('GET', DRIVE + '/' + id + '?fields=modifiedTime');
+    setClock(Date.parse(f.modifiedTime), (t0 + t1) / 2);
+  }
+
   /* ============================================================
-   * Общая конфигурация (лист _meta)
+   * Общая конфигурация (лист _meta, колонки A:B)
    * ============================================================ */
   function sharedCfg() {
     var groups = {};
@@ -518,17 +637,18 @@
     if (c.reload !== undefined) localStorage.setItem('gsync_reload', String(!!c.reload));
     restartTimers();
   }
-  function markCfgChanged() { lsSet('gsync_cfg_t', Date.now()); }
+  function markCfgChanged() { lsSet('gsync_cfg_t', now()); }
 
-  async function writeMeta(id, m) {
+  async function writeMeta(id, m, oldCount) {
     var rows = Object.keys(m).map(function (k) { return [k, String(m[k])]; });
-    await rewriteSheet(id, '_meta', rows, 'B');
+    await rewriteSheet(id, '_meta', rows, 'B', oldCount);
   }
 
   /* ============================================================
    * Синхронизация группы
    * ============================================================ */
   function isDel(x) { return x === 1 || x === true || x === '1' || x === 'TRUE'; }
+  function tomb(t) { return { v: null, h: '', t: t, d: true, cols: [], dirty: false }; }
 
   function reduceRows(g, rows) {
     var H = g.header.length, out = {};
@@ -546,72 +666,117 @@
   }
 
   function syncGroup(g, rows, ctx) {
-    var dir = direction(), now = Date.now(), dev = deviceName();
+    var dir = direction(), T = now(), dev = deviceName();
     var shadowKey = 'gsync_shadow_' + g.id;
     var first = !lsGet('gsync_inited_' + g.id, false);
     var shadow = lsGet(shadowKey, {}) || {};
-    var applyRemote = dir !== 'push' && !(g.cached && !ctx.startup);
-    var remote = reduceRows(g, rows);
-    var local = g.read(), n = local.length;
-    var state = {}, present = {};
+    var applyRemote = dir !== 'push' && (!g.cached || ctx.canApplyCached);
+    var skip = g.skip ? g.skip() : {};
+    var purged = ctx.purged[g.id] || 0;
+    var touches = lsGet('gsync_touch', {}) || {};
+    // Время локального изменения: из журнала изменений ключа, иначе — текущее
+    function changedAt(id, after) { var x = touches[g.keyOf(id)]; return x && x > after ? Math.min(x, T) : T; }
 
-    // 1. Локальные изменения относительно «тени» (последнего синхронизированного состояния)
+    var remote = reduceRows(g, rows);
+    Object.keys(skip).forEach(function (id) { delete remote[id]; });
+    var local = [], kept = [];
+    g.read().forEach(function (p) { (skip[p[0]] ? kept : local).push(p); });
+    var n = local.length, state = {}, present = {}, synced = {};
+
+    // 1. Локальные изменения относительно тени (последнего подтверждённого таблицей состояния)
     local.forEach(function (pair, idx) {
       var id = pair[0], e = pair[1];
       if (e.v === null || e.v === undefined) return;
       var i = e.i !== undefined ? e.i : idx;
       var h = hash(e.v), s = shadow[id], t;
       present[id] = true;
-      if (!s || s.d) t = g.order === 'asc' ? now - (n - idx) : now - i;
-      else if (s.h !== h) t = now;
-      else if (g.order === 'desc' && i === 0 && s.i !== 0) t = now; // поднят наверх списка
+      if (!s || s.d) { var base = changedAt(id, s ? s.t : 0); t = g.order === 'asc' ? base - (n - idx) : base - i; }
+      else if (s.h !== h) t = changedAt(id, s.t);
+      else if (g.order === 'desc' && i === 0 && s.i !== undefined && s.i !== 0) t = changedAt(id, s.t); // поднят наверх списка
       else t = s.t;
       state[id] = { v: e.v, h: h, t: t, d: false, i: i, cols: e.cols || [], dirty: !s || !!s.d || t !== s.t };
     });
     Object.keys(shadow).forEach(function (id) {
-      if (present[id]) return;
+      if (present[id] || skip[id]) return;
       var s = shadow[id];
-      if (s.d) {
-        if (now - s.t < CFG.TOMBSTONE_TTL_MS) state[id] = { v: null, h: '', t: s.t, d: true, cols: [], dirty: false };
-        return;
-      }
+      if (s.d) { if (T - s.t < CFG.TOMBSTONE_TTL_MS) state[id] = tomb(s.t); return; }
       if (g.kind === 'kv' && localStorage.getItem(id) !== null) return; // ключ стал локальным — у других не удаляем
-      state[id] = { v: null, h: '', t: now, d: true, cols: [], dirty: true };
+      state[id] = { v: null, h: '', t: changedAt(id, s.t), d: true, cols: [], dirty: true };
     });
 
-    // 2. Мерж с таблицей (побеждает больший updated_at; при первой синхронизации — таблица)
-    var received = 0, deferred = 0, removed = [];
+    // 2. Мерж с таблицей
+    var received = 0, deferred = 0, removed = [], pending = { add: [], del: [] };
+    function accept(id, r, l) {
+      if (r.d) removed.push(id);
+      state[id] = { v: r.v, h: r.d ? '' : hash(r.v), t: r.t, d: r.d, i: l ? l.i : undefined, cols: r.cols || [], dirty: false };
+      synced[id] = state[id];
+      received++;
+    }
     Object.keys(remote).forEach(function (id) {
       if (g.kind === 'kv' && isLocalOnly(id)) return;
       var r = remote[id], l = state[id];
-      var remoteWins = !l ? true : (first && !r.d) ? true : r.t > l.t;
+      // При первой синхронизации устройства/группы побеждает таблица — включая удаления
+      var remoteWins = !l || first || r.t > l.t;
       if (!remoteWins) {
-        if (l && !l.d && !l.dirty && l.t > r.t) l.dirty = true; // в таблице устаревшая версия
+        if (l.d && r.d) return;
+        if (!l.d && !r.d && l.h === hash(r.v)) { l.t = r.t; l.dirty = false; synced[id] = l; return; }
+        if (!l.dirty && l.t > r.t) l.dirty = true; // в таблице устаревшая версия (в т.ч. не дошедшее удаление)
         return;
       }
-      if (r.d && (!l || l.d)) { state[id] = { v: null, h: '', t: r.t, d: true, cols: [], dirty: false }; return; }
-      if (l && !l.d && !r.d && l.h === hash(r.v)) { l.t = r.t; l.dirty = false; return; }
-      if (!applyRemote) { if (dir !== 'push') deferred++; return; }
-      if (r.d) removed.push(id);
-      state[id] = { v: r.v, h: r.d ? '' : hash(r.v), t: r.t, d: r.d, i: l ? l.i : undefined, cols: r.cols, dirty: false };
-      received++;
-    });
-    Object.keys(state).forEach(function (id) {
-      var l = state[id];
-      if (!remote[id] && !l.d && !l.dirty) l.dirty = true; // в таблице нет — дозаписать
+      if (r.d && (!l || l.d)) { state[id] = tomb(Math.max(r.t, l ? l.t : 0)); synced[id] = state[id]; return; }
+      if (l && !l.d && !r.d && l.h === hash(r.v)) { l.t = r.t; l.dirty = false; synced[id] = l; return; }
+      if (dir === 'push') return;
+      if (!applyRemote) { if (l) l.dirty = false; deferred++; return; }
+      if (g.confirm) {
+        if ((!l || l.d) && !r.d) { pending.add.push({ id: id, v: r.v, t: r.t }); return; }
+        if (r.d && l && !l.d) { l.dirty = false; pending.del.push({ id: id, v: l.v, t: r.t }); return; }
+      }
+      accept(id, r, l);
     });
 
-    // 3. Применить полученное локально
+    // 3. Есть локально, но нет в таблице
+    Object.keys(state).forEach(function (id) {
+      var l = state[id];
+      if (remote[id] || l.d || l.dirty) return;
+      var s = shadow[id];
+      if (s && !s.d && s.t < purged) {
+        // удалён на других устройствах давно, его tombstone уже вычищен сжатием
+        if (dir === 'push') return;
+        if (!applyRemote) { deferred++; return; }
+        if (g.confirm) { pending.del.push({ id: id, v: l.v, t: purged }); return; }
+        accept(id, { v: null, t: purged, d: true, cols: [] }, l);
+      } else {
+        l.dirty = true; // строка потерялась (ручная правка, гонка сжатия) — дозаписать
+      }
+    });
+
+    // 4. Применить полученное локально
     if (received) {
       var entries = Object.keys(state)
         .filter(function (id) { return !state[id].d; })
         .map(function (id) { return { id: id, v: state[id].v, t: state[id].t }; });
       if (g.order === 'desc') entries.sort(function (a, b) { return b.t - a.t; });
       else if (g.order === 'asc') entries.sort(function (a, b) { return a.t - b.t; });
+      kept.forEach(function (p) { entries.push({ id: p[0], v: p[1].v, t: T }); });
       g.write(entries, removed);
+      // хеш и позиция — по тому, как значения реально легли в хранилище (иначе нормализация вызовет повторную отправку)
+      var fresh = {};
+      g.read().forEach(function (p, idx) { fresh[p[0]] = { v: p[1].v, i: p[1].i !== undefined ? p[1].i : idx }; });
+      Object.keys(state).forEach(function (id) {
+        var x = state[id];
+        if (x.d || !fresh[id]) return;
+        x.i = fresh[id].i;
+        if (synced[id] && fresh[id].v != null) x.h = hash(fresh[id].v);
+      });
     }
 
-    // 4. Строки для отправки
+    // Тень фазы A: то, что уже совпадает с таблицей, фиксируется сразу
+    var shadowA = {};
+    Object.keys(shadow).forEach(function (id) { if (!skip[id]) shadowA[id] = shadow[id]; });
+    Object.keys(synced).forEach(function (id) { var x = synced[id]; shadowA[id] = { h: x.h, t: x.t, d: x.d, i: x.i }; });
+    lsSet(shadowKey, shadowA);
+
+    // 5. Строки для отправки
     var out = [], skipped = 0, nCols = g.header.length - 5;
     if (dir !== 'pull') {
       Object.keys(state).forEach(function (id) {
@@ -623,42 +788,70 @@
         out.push([id].concat(cols, [l.d ? '' : l.v, l.t, l.d ? 1 : 0, dev]));
       });
     }
-    if (skipped) log(g.title + ': пропущено ' + skipped + ' слишком больших значений');
+    if (skipped) log(g.title + ': пропущено ' + skipped + ' значений больше ' + CFG.CELL_LIMIT + ' символов');
 
-    // 5. Новая тень
+    // Полная тень — фиксируется только после успешной отправки (фаза B)
     var ns = {}, live = 0;
     Object.keys(state).forEach(function (id) {
       var l = state[id];
       ns[id] = { h: l.h, t: l.t, d: l.d, i: l.i };
       if (!l.d) live++;
     });
-    lsSet(shadowKey, ns);
-    lsSet('gsync_inited_' + g.id, true);
+    function commit(full) {
+      if (full) lsSet(shadowKey, ns);
+      if (!deferred && (full || dir === 'pull')) lsSet('gsync_inited_' + g.id, true);
+    }
 
-    return { rows: out, received: received, deferred: deferred, live: live };
+    return { rows: out, received: received, deferred: deferred, live: live, pending: pending, commit: commit };
   }
+
+  /* ============================================================
+   * Сжатие (с блокировкой между устройствами)
+   * ============================================================ */
+  async function takeLock(id) {
+    var svc = await readSvc(id), cur = String(svc.compact_lock || '').split('|'), me = deviceName() + '#' + SESSION;
+    if (cur[0] && cur[0] !== me && now() - Number(cur[1]) < CFG.LOCK_MS) return false;
+    await writeSvc(id, 'compact_lock', me + '|' + now());
+    await sleep(2000);
+    var v = (await batchGet(id, ['_meta!E' + svcRow('compact_lock')]))[0];
+    return !!(v[0] && String(v[0][0]).split('|')[0] === me);
+  }
+  function releaseLock(id) { return writeSvc(id, 'compact_lock', '').catch(function () {}); }
 
   async function compactGroup(id, g) {
     var rows = (await batchGet(id, [g.sheet + '!A2:Z']))[0];
-    var red = reduceRows(g, rows), H = g.header.length, now = Date.now();
-    var keep = Object.keys(red).map(function (k) { return red[k].raw; }).filter(function (r) {
-      return !(isDel(r[H - 2]) && now - Number(r[H - 3]) > CFG.TOMBSTONE_TTL_MS);
-    });
-    await rewriteSheet(id, g.sheet, keep, 'Z');
+    var red = reduceRows(g, rows), H = g.header.length, horizon = now() - CFG.TOMBSTONE_TTL_MS;
+    var keep = Object.keys(red).map(function (k) { return red[k]; })
+      .filter(function (x) { return !(x.d && x.t < horizon); })
+      .map(function (x) { return pad(x.raw, H); });
+    // сначала горизонт очистки, потом удаление строк: устройства, не видевшие удаление, поймут, что элемент удалён
+    await writeSvc(id, 'purged_' + g.id, horizon);
+    await rewriteSheet(id, g.sheet, keep, 'Z', rows.length);
     return { before: rows.length, after: keep.length };
+  }
+
+  async function maybeCompact(id, results) {
+    var todo = results.filter(function (x) { return x.rowCount > Math.max(CFG.COMPACT_MIN_ROWS, x.r.live * 2); });
+    if (!todo.length || !(await takeLock(id))) return;
+    try { for (var i = 0; i < todo.length; i++) await compactGroup(id, todo[i].g); }
+    finally { await releaseLock(id); }
   }
 
   /* ============================================================
    * Полный цикл синхронизации
    * ============================================================ */
-  var busy = null, again = false;
+  var busy = null, again = false, authNotified = false, cubNoted = false;
 
   function syncAll(opts) {
     opts = opts || {};
     if (busy) { again = true; return busy; }
     busy = doSync(opts).catch(function (e) {
       log('Ошибка: ' + msg(e));
-      if (!opts.silent) noty('Синхронизация: ' + msg(e));
+      // ошибки авторизации показываем даже в фоне — иначе синхронизация молча остановится
+      if (!opts.silent || (e.auth && !authNotified)) {
+        noty('Lampa GSync: ' + msg(e));
+        if (e.auth) authNotified = true;
+      }
     }).then(function () {
       busy = null;
       if (again) { again = false; syncAll({ silent: true }); }
@@ -666,61 +859,144 @@
     return busy;
   }
 
+  function reloadedThisSession() { try { return sessionStorage.getItem('gsync_reloaded') === '1'; } catch (e) { return false; } }
+  function doReload(text) {
+    try { sessionStorage.setItem('gsync_reloaded', '1'); } catch (e) {}
+    noty(text);
+    setTimeout(function () { location.reload(); }, 1500);
+  }
+
   async function doSync(opts) {
-    if (!isLoggedIn()) throw new Error('не выполнен вход');
+    if (!isLoggedIn()) throw authError('не выполнен вход в Google');
     var ss = await ensureSpreadsheet();
+    if (!clockKnown) { try { await probeClock(ss.id); } catch (e) {} clockKnown = true; }
 
     // Конфигурация
-    var metaRows = (await batchGet(ss.id, ['_meta!A2:B']))[0], meta = {};
-    metaRows.forEach(function (r) { if (r[0]) meta[r[0]] = r[1]; });
+    var metaRows = (await batchGet(ss.id, ['_meta!A2:E']))[0], meta = {}, svc = {};
+    metaRows.forEach(function (r) { if (r[0]) meta[r[0]] = r[1]; if (r[3]) svc[r[3]] = r[4]; });
     if (Number(meta.schema_version || 0) > CFG.SCHEMA) throw new Error('таблица от более новой версии плагина — обновите плагин');
     var remoteCfgT = Number(meta.cfg_t || 0), localCfgT = Number(lsGet('gsync_cfg_t', 0)) || 0;
     if (remoteCfgT > localCfgT && meta.cfg) {
       applySharedCfg(safeParse(meta.cfg));
       lsSet('gsync_cfg_t', remoteCfgT);
     } else if (localCfgT > remoteCfgT || !meta.schema_version) {
-      var t = localCfgT || Date.now();
-      await writeMeta(ss.id, { schema_version: CFG.SCHEMA, cfg: JSON.stringify(sharedCfg()), cfg_t: t, updated_by: deviceName() });
+      var t = localCfgT || now();
+      await writeMeta(ss.id, { schema_version: CFG.SCHEMA, cfg: JSON.stringify(sharedCfg()), cfg_t: t, updated_by: deviceName() }, metaRows.length);
       lsSet('gsync_cfg_t', t);
     }
 
-    var groups = GROUPS.filter(function (g) { return groupEnabled(g.id); });
-    if (!groups.length) { log('Нет включённых групп'); return; }
+    var cub = cubYield();
+    if (cub && !cubNoted) { log('Вход в CUB: закладки и прогресс синхронизирует CUB, GSync их пропускает'); cubNoted = true; }
+    var groups = GROUPS.filter(function (g) { return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0); });
+    if (!groups.length) { log('Нет групп для синхронизации'); return; }
     await ensureSheets(ss, groups.map(function (g) { return g.sheet; }));
     var data = await batchGet(ss.id, groups.map(function (g) { return g.sheet + '!A2:Z'; }));
 
-    var total = { pushed: 0, received: 0, deferred: 0 }, needReload = false, results = [];
+    var reloaded = reloadedThisSession(), purged = {};
+    GROUPS.forEach(function (g) { purged[g.id] = Number(svc['purged_' + g.id]) || 0; });
+    var ctx = { startup: !!opts.startup, canApplyCached: !!opts.startup && !reloaded, purged: purged };
+
+    var total = { pushed: 0, received: 0, deferred: 0 }, reloadCached = false, reloadSettings = false, results = [], pending = null;
     groups.forEach(function (g, i) {
-      var r = syncGroup(g, data[i], opts);
+      var r = syncGroup(g, data[i], ctx);
       results.push({ g: g, r: r, rowCount: data[i].length + r.rows.length });
       total.pushed += r.rows.length; total.received += r.received; total.deferred += r.deferred;
-      if (r.received && (g.cached || g.kind === 'kv')) needReload = true;
+      if (r.received && g.cached) reloadCached = true;
+      if (r.received && g.kind === 'kv') reloadSettings = true;
+      if (r.pending.add.length || r.pending.del.length) pending = { g: g, list: r.pending };
     });
 
+    // Отправка; тень группы фиксируется только после успешной записи её строк
+    var full = direction() !== 'pull';
     for (var i = 0; i < results.length; i++) {
       if (results[i].r.rows.length) await appendRows(ss.id, results[i].g.sheet, results[i].r.rows);
+      results[i].r.commit(full);
     }
-    for (var j = 0; j < results.length; j++) {
-      var x = results[j];
-      if (x.rowCount > Math.max(CFG.COMPACT_MIN_ROWS, x.r.live * 2)) await compactGroup(ss.id, x.g);
-    }
+    await maybeCompact(ss.id, results);
+    pruneTouches();
 
     lsSet('gsync_last', Date.now());
     log('Синхронизация: отправлено ' + total.pushed + ', получено ' + total.received + (total.deferred ? ', отложено ' + total.deferred : ''));
 
-    var reloaded = false;
-    try { reloaded = sessionStorage.getItem('gsync_reloaded') === '1'; } catch (e) {}
-    if (opts.startup && needReload && boolSetting('gsync_reload', true) && !reloaded) {
-      try { sessionStorage.setItem('gsync_reloaded', '1'); } catch (e) {}
-      noty('Получены изменения с других устройств — перезапуск…');
-      setTimeout(function () { location.reload(); }, 1500);
-    } else if (total.received || total.deferred) {
-      noty('Синхронизация: получено ' + total.received +
-        (total.deferred ? ', закладки/плагины применятся при следующем запуске' : '') +
-        (needReload ? '. Часть настроек применится после перезапуска' : ''));
+    // Закладки и плагины Lampa держит в памяти — применённые изменения требуют перезапуска всегда
+    var willReload = !!opts.startup && !reloaded && (reloadCached || (reloadSettings && boolSetting('gsync_reload', true)));
+    if (pending) return showPluginsDialog(pending.g, pending.list, willReload);
+    if (willReload) doReload('Получены изменения с других устройств — перезапуск…');
+    else if (total.received) {
+      noty('Lampa GSync: получено ' + total.received + (reloadSettings ? '. Часть настроек применится после перезапуска' : ''));
+    } else if (total.deferred && !opts.silent) {
+      noty('Lampa GSync: изменения закладок/плагинов применятся при следующем запуске');
     } else if (opts.manual) {
       noty('Синхронизировано: отправлено ' + total.pushed);
     }
+  }
+
+  /* ============================================================
+   * Плагины с других устройств — выбор галочками
+   * ============================================================ */
+  function pluginLabelOf(v) {
+    var o = safeParse(v), url = typeof o === 'string' ? o : ((o && o.url) || '');
+    var name = (o && typeof o === 'object' && o.name) || url.split('/').pop().replace(/\?.*$/, '') || url;
+    return { name: name, url: url };
+  }
+
+  function showPluginsDialog(g, list, willReload) {
+    var items = list.add.map(function (x) { return { x: x, kind: 'add', on: true }; })
+      .concat(list.del.map(function (x) { return { x: x, kind: 'del', on: true }; }));
+    function toContent() { try { Lampa.Controller.toggle('content'); } catch (e) {} }
+
+    function render(focus) {
+      var rows = [{ title: 'Применить', subtitle: 'Отмеченное установить/удалить и перезапустить. Неотмеченное больше не предлагать', apply: true }];
+      items.forEach(function (it, n) {
+        var lb = pluginLabelOf(it.x.v);
+        rows.push({
+          title: (it.on ? '☑ ' : '☐ ') + (it.kind === 'add' ? 'Установить: ' : 'Удалить: ') + lb.name,
+          subtitle: lb.url, n: n, selected: n === focus
+        });
+      });
+      Lampa.Select.show({
+        title: 'Плагины с других устройств',
+        items: rows,
+        onSelect: function (s) {
+          if (s.apply) return applyPlugins(g, items, willReload);
+          items[s.n].on = !items[s.n].on;
+          render(s.n);
+        },
+        onBack: function () {
+          // отложить решение до следующего запуска
+          if (willReload) doReload('Получены изменения с других устройств — перезапуск…');
+          else toContent();
+        }
+      });
+    }
+    render(-1);
+  }
+
+  function applyPlugins(g, items, willReload) {
+    var add = [], del = {};
+    var declined = lsGet('gsync_plugins_declined', {}) || {};
+    items.forEach(function (it) {
+      if (!it.on) declined[it.x.id] = true;
+      else if (it.kind === 'add') add.push(it.x);
+      else del[it.x.id] = it.x;
+    });
+    lsSet('gsync_plugins_declined', declined);
+
+    var entries = g.read().filter(function (p) { return !del[p[0]]; }).map(function (p) { return { id: p[0], v: p[1].v }; });
+    add.forEach(function (x) { entries.push({ id: x.id, v: x.v }); });
+    g.write(entries, []);
+
+    // Тень: установленное и удалённое теперь совпадает с таблицей
+    var shadow = lsGet('gsync_shadow_' + g.id, {}) || {}, fresh = {};
+    g.read().forEach(function (p) { fresh[p[0]] = p[1]; });
+    add.forEach(function (x) { if (fresh[x.id]) shadow[x.id] = { h: hash(fresh[x.id].v), t: x.t, d: false }; });
+    Object.keys(del).forEach(function (id) { shadow[id] = { h: '', t: del[id].t, d: true }; });
+    lsSet('gsync_shadow_' + g.id, shadow);
+
+    var changed = add.length + Object.keys(del).length;
+    log('Плагины: установлено ' + add.length + ', удалено ' + Object.keys(del).length + ', отклонено ' + items.filter(function (it) { return !it.on; }).length);
+    if (changed || willReload) doReload(changed ? 'Плагины обновлены — перезапуск…' : 'Получены изменения с других устройств — перезапуск…');
+    else { try { Lampa.Controller.toggle('content'); } catch (e) {} }
   }
 
   /* ============================================================
@@ -786,8 +1062,9 @@
       var obj = JSON.parse(data), same = obj.device === deviceName();
       Object.keys(obj.keys || {}).forEach(function (k) {
         if (isHardDenied(k)) return;
-        if (!same && isDefaultDenied(k)) return; // настройки чужого устройства не переносим
+        if (!same && isLocalOnly(k)) return; // привязанное к устройству и твои исключения со снимка чужого устройства не переносим
         localStorage.setItem(k, obj.keys[k]);
+        touch(k); // восстановленное считается свежей правкой и уйдёт в таблицу
       });
       // Сброс теней: восстановленное состояние уйдёт в таблицу как новое
       GROUPS.forEach(function (g) { localStorage.removeItem('gsync_shadow_' + g.id); });
@@ -799,8 +1076,11 @@
 
   async function compactAll() {
     if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    var ss;
     try {
-      var ss = await ensureSpreadsheet(), before = 0, after = 0;
+      ss = await ensureSpreadsheet();
+      if (!(await takeLock(ss.id))) return noty('Таблицу сейчас сжимает другое устройство');
+      var before = 0, after = 0;
       for (var i = 0; i < GROUPS.length; i++) {
         var g = GROUPS[i];
         if (ss.titles.indexOf(g.sheet) < 0) continue;
@@ -810,6 +1090,7 @@
       log('Сжатие: ' + before + ' → ' + after + ' строк');
       noty('Таблица сжата: ' + before + ' → ' + after + ' строк');
     } catch (e) { noty('Сжатие: ' + msg(e)); }
+    finally { if (ss) await releaseLock(ss.id); }
   }
 
   /* ============================================================
@@ -1012,10 +1293,11 @@
         onChange: fn, onRender: render
       });
     }
-    function trigger(name, label, descr, def, fn) {
+    function trigger(name, label, descr, def, fn, render) {
       Lampa.SettingsApi.addParam({
         component: C, param: { name: name, type: 'trigger', default: def }, field: { name: label, description: descr || '' },
-        onChange: function () { setTimeout(fn || function () {}, 0); }
+        onChange: function () { setTimeout(fn || function () {}, 0); },
+        onRender: render
       });
     }
     function select(name, label, values, def, fn) {
@@ -1038,8 +1320,14 @@
       trigger('gsync_g_' + g.id, g.title, g.descr, DEFAULT_GROUPS[g.id], function () {
         if (!groupEnabled(g.id)) { localStorage.removeItem('gsync_shadow_' + g.id); localStorage.removeItem('gsync_inited_' + g.id); }
         markCfgChanged();
+      }, function (item) {
+        if (CUB_GROUPS.indexOf(g.id) >= 0 && cubYield()) {
+          item.find('.settings-param__descr').text(g.descr + ' · Сейчас пропускается: выполнен вход в CUB');
+        }
       });
     });
+    trigger('gsync_cub_yield', 'Уступать CUB (для этого устройства)',
+      'Если выполнен вход в CUB, закладки и прогресс синхронизирует CUB, а GSync их пропускает — иначе две системы перетирают друг друга', true);
 
     title('mode', 'Режим');
     select('gsync_mode', 'Когда синхронизировать',
@@ -1066,6 +1354,16 @@
     });
     button('gsync_exclusions', 'Исключения', 'Какие настройки остаются только на этом устройстве', function () { openExclusions(); });
     button('gsync_log', 'Журнал', 'Последние синхронизации и ошибки', openLog);
+    button('gsync_declined_reset', 'Отклонённые плагины', '', function () {
+      var n = Object.keys(lsGet('gsync_plugins_declined', {}) || {}).length;
+      if (!n) return noty('Отклонённых плагинов нет');
+      localStorage.removeItem('gsync_plugins_declined');
+      log('Сброшен список отклонённых плагинов (' + n + ')');
+      noty('Сброшено: ' + n + '. Плагины будут предложены снова при следующем запуске');
+    }, function (item) {
+      var n = Object.keys(lsGet('gsync_plugins_declined', {}) || {}).length;
+      item.find('.settings-param__descr').text(n ? 'Не ставить на этом устройстве: ' + n + '. Нажмите, чтобы сбросить' : 'Нет отклонённых');
+    });
   }
 
   /* ============================================================
@@ -1096,10 +1394,11 @@
   function bindListeners() {
     if (Lampa.Storage && Lampa.Storage.listener) {
       Lampa.Storage.listener.follow('change', function (e) {
-        if (!e || !e.name || /^gsync_/.test(e.name)) return;
+        if (!e || !e.name || /^gsync_/.test(e.name) || !relevantKey(e.name)) return;
+        touch(e.name); // время правки — для честного разрешения конфликтов
         if (!isLoggedIn() || mode() !== 'auto') return;
         if (/^file_view/.test(e.name) && boolSetting('gsync_progress_pause', true)) return;
-        if (relevantKey(e.name)) schedule(CFG.DEBOUNCE_MS);
+        schedule(CFG.DEBOUNCE_MS);
       });
     }
     try {
