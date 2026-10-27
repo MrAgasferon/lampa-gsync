@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.2.1
+ * Версия 0.3.0
  */
 (function () {
   'use strict';
@@ -18,7 +18,7 @@
     SCOPE: 'openid email https://www.googleapis.com/auth/drive.file',
     FILE_NAME: 'Lampa Sync',
     APP_PROP: 'lampa_gsync',
-    SCHEMA: 1,
+    SCHEMA: 2,                               // 2: колонка sig в листе plugins
     DEBOUNCE_MS: 8000,
     PERIODIC_MS: 5 * 60 * 1000,
     CELL_LIMIT: 45000,                       // лимит ячейки Sheets — 50 000 символов
@@ -130,6 +130,117 @@
     return !!(a && typeof a === 'object' && a.token) && boolSetting('account_use', true);
   }
   function cubYield() { return boolSetting('gsync_cub_yield', true) && cubActive(); }
+
+  /* ============================================================
+   * Криптография: SHA-256 / HMAC / PBKDF2 на чистом JS
+   * (crypto.subtle недоступен на http-страницах, например http://lampa.mx)
+   * ============================================================ */
+  var Crypto = (function () {
+    var K = [
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+    var IV = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var W = new Array(64);
+
+    function compress(H, b, off) {
+      var i, a, bb, c, d, e, f, g, h, s0, s1, t1, t2;
+      for (i = 0; i < 16; i++) W[i] = (b[off + i * 4] << 24) | (b[off + i * 4 + 1] << 16) | (b[off + i * 4 + 2] << 8) | b[off + i * 4 + 3];
+      for (i = 16; i < 64; i++) {
+        s0 = ((W[i - 15] >>> 7) | (W[i - 15] << 25)) ^ ((W[i - 15] >>> 18) | (W[i - 15] << 14)) ^ (W[i - 15] >>> 3);
+        s1 = ((W[i - 2] >>> 17) | (W[i - 2] << 15)) ^ ((W[i - 2] >>> 19) | (W[i - 2] << 13)) ^ (W[i - 2] >>> 10);
+        W[i] = (W[i - 16] + s0 + W[i - 7] + s1) | 0;
+      }
+      a = H[0]; bb = H[1]; c = H[2]; d = H[3]; e = H[4]; f = H[5]; g = H[6]; h = H[7];
+      for (i = 0; i < 64; i++) {
+        s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+        t1 = (h + s1 + ((e & f) ^ (~e & g)) + K[i] + W[i]) | 0;
+        s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+        t2 = (s0 + ((a & bb) ^ (a & c) ^ (bb & c))) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+      }
+      H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+
+    // Хеш сообщения msg (массив байт), продолжая состояние init, уже обработавшее prefixLen байт (кратно 64)
+    function digest(msg, init, prefixLen) {
+      var H = (init || IV).slice(), total = (prefixLen || 0) + msg.length;
+      var padLen = ((msg.length + 9 + 63) >> 6) << 6, b = new Array(padLen), i;
+      for (i = 0; i < msg.length; i++) b[i] = msg[i];
+      b[msg.length] = 0x80;
+      for (i = msg.length + 1; i < padLen; i++) b[i] = 0;
+      var bits = total * 8;
+      b[padLen - 4] = (bits >>> 24) & 255; b[padLen - 3] = (bits >>> 16) & 255; b[padLen - 2] = (bits >>> 8) & 255; b[padLen - 1] = bits & 255;
+      b[padLen - 5] = Math.floor(bits / 4294967296) & 255;
+      for (i = 0; i < padLen; i += 64) compress(H, b, i);
+      var out = new Array(32);
+      for (i = 0; i < 8; i++) { out[i * 4] = (H[i] >>> 24) & 255; out[i * 4 + 1] = (H[i] >>> 16) & 255; out[i * 4 + 2] = (H[i] >>> 8) & 255; out[i * 4 + 3] = H[i] & 255; }
+      return out;
+    }
+
+    function utf8(s) {
+      var out = [], i, c;
+      s = unescape(encodeURIComponent(String(s)));
+      for (i = 0; i < s.length; i++) { c = s.charCodeAt(i); out.push(c); }
+      return out;
+    }
+    function hex(b) { var s = '', i; for (i = 0; i < b.length; i++) s += (b[i] < 16 ? '0' : '') + b[i].toString(16); return s; }
+    function unhex(s) { var b = [], i; for (i = 0; i < s.length; i += 2) b.push(parseInt(s.substr(i, 2), 16)); return b; }
+
+    // Состояния после блоков key^ipad и key^opad — HMAC без повторного хеширования ключа
+    function hmacState(key) {
+      if (key.length > 64) key = digest(key);
+      var ip = new Array(64), op = new Array(64), i;
+      for (i = 0; i < 64; i++) { var k = i < key.length ? key[i] : 0; ip[i] = k ^ 0x36; op[i] = k ^ 0x5c; }
+      var Hi = IV.slice(), Ho = IV.slice();
+      compress(Hi, ip, 0); compress(Ho, op, 0);
+      return { i: Hi, o: Ho };
+    }
+    function hmacWith(st, msg) { return digest(digest(msg, st.i, 64), st.o, 64); }
+    function hmac(key, msg) { return hmacWith(hmacState(key), msg); }
+
+    function pbkdf2(pass, salt, iter, len) {
+      var st = hmacState(pass), out = [], block = 1;
+      while (out.length < len) {
+        var u = hmacWith(st, salt.concat([(block >>> 24) & 255, (block >>> 16) & 255, (block >>> 8) & 255, block & 255]));
+        var t = u.slice();
+        for (var n = 1; n < iter; n++) { u = hmacWith(st, u); for (var j = 0; j < 32; j++) t[j] ^= u[j]; }
+        out = out.concat(t); block++;
+      }
+      return out.slice(0, len);
+    }
+
+    return { sha256: digest, hmac: hmac, pbkdf2: pbkdf2, utf8: utf8, hex: hex, unhex: unhex };
+  })();
+
+  /* ---------- Ключ синхронизации: подпись строк листа plugins ---------- */
+  var KEY_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // без 0/O, 1/I/L
+  var KEY_SALT = 'lampa-gsync-v1', KEY_ITER = 20000, KEY_MIN = 12;
+  var keyStatus = '';  // '' | 'ok' | 'mismatch' | 'need' — результат последней синхронизации
+
+  function normKey(s) { return String(s || '').replace(/[\s\-]/g, '').toUpperCase(); }
+  function fmtKey(s) { return /^[0-9A-Z]{16}$/.test(s) ? s.replace(/(.{4})(?=.)/g, '$1-') : s; }
+  function genKey() {
+    var out = '', b = new Uint8Array(1);
+    while (out.length < 16) {
+      try { crypto.getRandomValues(b); } catch (e) { b[0] = Math.floor(Math.random() * 256); }
+      if (b[0] < 248) out += KEY_ALPHABET[b[0] % 31]; // отбрасываем хвост — без перекоса распределения
+    }
+    return out;
+  }
+  function deriveKey(phrase) { return Crypto.pbkdf2(Crypto.utf8(normKey(phrase)), Crypto.utf8(KEY_SALT), KEY_ITER, 32); }
+  function syncKey() { var k = localStorage.getItem('gsync_key'); return k ? Crypto.unhex(k) : null; }
+  function keyCheck(key) { return Crypto.hex(Crypto.hmac(key, Crypto.utf8('gsync-key-check'))).slice(0, 32); }
+  function rowSig(key, id, v, t, d) {
+    return Crypto.hex(Crypto.hmac(key, Crypto.utf8([id, d ? '' : v, Number(t) || 0, d ? 1 : 0].join('\n')))).slice(0, 32);
+  }
 
   /* ============================================================
    * Группы синхронизации (один лист на группу)
@@ -275,6 +386,8 @@
     kvGroup('settings_sources', 'Источники и парсеры', 'Источник по умолчанию, парсеры, балансеры'),
     containerGroup({
       id: 'plugins', sheet: 'plugins', order: 'asc', cached: true, title: 'Список плагинов',
+      header: ['item_id', 'storage_key', 'item', 'sig', 'json', 'updated_at', 'deleted', 'device'],
+      signed: true,                                                           // строки подписываются ключом синхронизации
       descr: 'Установленные плагины. Новые с других устройств — с выбором галочками',
       claim: function (k) { return k === 'plugins'; },
       confirm: true,                                                          // добавления/удаления — через диалог
@@ -510,6 +623,7 @@
   // D2:E2 — блокировка сжатия, D3+:E3+ — горизонт очистки удалений по группам
   function svcRow(key) {
     if (key === 'compact_lock') return 2;
+    if (key === 'key_check') return 4 + GROUPS.length;
     var g = key.replace(/^purged_/, '');
     return 3 + GROUPS.indexOf(GROUP_BY_ID[g]);
   }
@@ -678,6 +792,18 @@
     // Время локального изменения: из журнала изменений ключа, иначе — текущее
     function changedAt(id, after) { var x = touches[g.keyOf(id)]; return x && x > after ? Math.min(x, T) : T; }
 
+    // Подпись: строки без верной подписи ключом синхронизации игнорируются
+    var rejected = {}, badSig = 0, unsigned = 0, sigCol = g.signed ? g.header.indexOf('sig') : -1;
+    if (g.signed && ctx.key) {
+      var HH = g.header.length;
+      rows = rows.filter(function (r) {
+        if (r[0] === undefined || r[0] === '') return false;
+        var d = isDel(r[HH - 2]), v = r[HH - 4] === undefined ? '' : String(r[HH - 4]);
+        var ok = !!r[sigCol] && String(r[sigCol]) === rowSig(ctx.key, String(r[0]), v, r[HH - 3], d);
+        if (!ok) { rejected[String(r[0])] = true; if (r[sigCol]) badSig++; else unsigned++; }
+        return ok;
+      });
+    }
     var remote = reduceRows(g, rows);
     Object.keys(skip).forEach(function (id) { delete remote[id]; });
     var local = [], kept = [];
@@ -740,7 +866,7 @@
       var l = state[id];
       if (remote[id] || l.d || l.dirty) return;
       var s = shadow[id];
-      if (s && !s.d && s.t < purged) {
+      if (s && !s.d && s.t < purged && !rejected[id]) {
         // удалён на других устройствах давно, его tombstone уже вычищен сжатием
         if (dir === 'push') return;
         if (!applyRemote) { deferred++; return; }
@@ -786,6 +912,7 @@
         if (!l.d && l.v.length > CFG.CELL_LIMIT) { skipped++; return; }
         var cols = (l.cols || []).slice(0, nCols);
         while (cols.length < nCols) cols.push('');
+        if (sigCol > 0 && ctx.key) cols[sigCol - 1] = rowSig(ctx.key, id, l.v, l.t, l.d);
         out.push([id].concat(cols, [l.d ? '' : l.v, l.t, l.d ? 1 : 0, dev]));
       });
     }
@@ -803,7 +930,8 @@
       if (!deferred && (full || dir === 'pull')) lsSet('gsync_inited_' + g.id, true);
     }
 
-    return { rows: out, received: received, deferred: deferred, live: live, pending: pending, commit: commit };
+    if (badSig || unsigned) log(g.title + ': проигнорировано строк — с неверной подписью ' + badSig + ', без подписи ' + unsigned);
+    return { rows: out, received: received, deferred: deferred, live: live, pending: pending, commit: commit, badSig: badSig };
   }
 
   /* ============================================================
@@ -839,9 +967,26 @@
   }
 
   /* ============================================================
+   * Миграции схемы таблицы
+   * ============================================================ */
+  async function migrate(ss, from) {
+    if (from < 2 && ss.titles.indexOf('plugins') >= 0) {
+      var rows = (await batchGet(ss.id, ['plugins!A1:Z']))[0];
+      if (rows.length && rows[0][3] === 'json') {
+        var H = GROUP_BY_ID.plugins.header;
+        var out = rows.map(function (r, i) {
+          return i === 0 ? H.slice() : pad([r[0], r[1], r[2], ''].concat(r.slice(3, 7)), H.length);
+        });
+        await putRange(ss.id, 'plugins!A1', out);
+        log('Лист plugins переведён на схему 2 (колонка sig)');
+      }
+    }
+  }
+
+  /* ============================================================
    * Полный цикл синхронизации
    * ============================================================ */
-  var busy = null, again = false, authNotified = false, cubNoted = false;
+  var busy = null, again = false, authNotified = false, cubNoted = false, keyNoted = false, badSigNoted = false;
 
   function syncAll(opts) {
     opts = opts || {};
@@ -887,25 +1032,47 @@
     metaRows.forEach(function (r) { if (r[0]) meta[r[0]] = r[1]; if (r[3]) svc[r[3]] = r[4]; });
     if (Number(meta.schema_version || 0) > CFG.SCHEMA) throw new Error('таблица от более новой версии плагина — обновите плагин');
     var remoteCfgT = Number(meta.cfg_t || 0), localCfgT = Number(lsGet('gsync_cfg_t', 0)) || 0;
+    var needMeta = false;
     if (remoteCfgT > localCfgT && meta.cfg) {
       applySharedCfg(safeParse(meta.cfg));
       lsSet('gsync_cfg_t', remoteCfgT);
-    } else if (localCfgT > remoteCfgT || !meta.schema_version) {
-      var t = localCfgT || now();
+    } else if (localCfgT > remoteCfgT || !meta.schema_version) needMeta = true;
+    if (Number(meta.schema_version || 0) < CFG.SCHEMA) { await migrate(ss, Number(meta.schema_version || 0)); needMeta = true; }
+    if (needMeta) {
+      var t = Number(lsGet('gsync_cfg_t', 0)) || now();
       await writeMeta(ss.id, { schema_version: CFG.SCHEMA, cfg: JSON.stringify(sharedCfg()), cfg_t: t, updated_by: deviceName() }, metaRows.length);
       lsSet('gsync_cfg_t', t);
     }
 
+    // Ключ синхронизации: проверка совпадения с таблицей
+    var key = syncKey(), skipPlugins = false;
+    if (key) {
+      var kc = keyCheck(key);
+      if (!svc.key_check) { await writeSvc(ss.id, 'key_check', kc); keyStatus = 'ok'; log('Ключ синхронизации заведён в таблице'); }
+      else if (svc.key_check !== kc) { keyStatus = 'mismatch'; skipPlugins = true; }
+      else keyStatus = 'ok';
+    } else if (svc.key_check) { keyStatus = 'need'; skipPlugins = true; }
+    else keyStatus = '';
+    if (skipPlugins && groupEnabled('plugins') && !keyNoted) {
+      keyNoted = true;
+      var km = keyStatus === 'need'
+        ? 'В таблице включена защита ключом — введите ключ синхронизации, иначе плагины на этом устройстве не синхронизируются'
+        : 'Ключ синхронизации не совпадает с таблицей — плагины на этом устройстве не синхронизируются';
+      log(km); noty('Lampa GSync: ' + km);
+    }
+
     var cub = cubYield();
     if (cub && !cubNoted) { log('Вход в CUB: закладки и прогресс синхронизирует CUB, GSync их пропускает'); cubNoted = true; }
-    var groups = GROUPS.filter(function (g) { return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0); });
+    var groups = GROUPS.filter(function (g) {
+      return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0) && !(skipPlugins && g.signed);
+    });
     if (!groups.length) { log('Нет групп для синхронизации'); return; }
     await ensureSheets(ss, groups.map(function (g) { return g.sheet; }));
     var data = await batchGet(ss.id, groups.map(function (g) { return g.sheet + '!A2:Z'; }));
 
     var reloaded = reloadedThisSession(), purged = {};
     GROUPS.forEach(function (g) { purged[g.id] = Number(svc['purged_' + g.id]) || 0; });
-    var ctx = { startup: !!opts.startup, canApplyCached: !!opts.startup && !reloaded, purged: purged };
+    var ctx = { startup: !!opts.startup, canApplyCached: !!opts.startup && !reloaded, purged: purged, key: key };
 
     var total = { pushed: 0, received: 0, deferred: 0 }, reloadCached = false, reloadSettings = false, results = [], pending = null;
     groups.forEach(function (g, i) {
@@ -915,6 +1082,10 @@
       if (r.received && g.cached) reloadCached = true;
       if (r.received && g.kind === 'kv') reloadSettings = true;
       if (r.pending.add.length || r.pending.del.length) pending = { g: g, list: r.pending };
+      if (r.badSig && !badSigNoted) {
+        badSigNoted = true;
+        noty('⚠ Lampa GSync: в листе ' + g.sheet + ' ' + r.badSig + ' строк с неверной подписью — проигнорированы. Возможна попытка подмены');
+      }
     });
 
     // Отправка; тень группы фиксируется только после успешной записи её строк
@@ -1102,6 +1273,124 @@
       noty('Таблица сжата: ' + before + ' → ' + after + ' строк');
     } catch (e) { noty('Сжатие: ' + msg(e)); }
     finally { if (ss) await releaseLock(ss.id); }
+  }
+
+  /* ============================================================
+   * Ключ синхронизации: создание, ввод, просмотр
+   * ============================================================ */
+  async function tableKeyCheck() {
+    var ss = await ensureSpreadsheet();
+    return { id: ss.id, check: (await readSvc(ss.id)).key_check || '' };
+  }
+
+  function saveKey(phrase, key) {
+    localStorage.setItem('gsync_key', Crypto.hex(key));
+    localStorage.setItem('gsync_key_phrase', phrase);
+    keyNoted = false; badSigNoted = false;
+  }
+
+  function askText(title, done) {
+    try {
+      if (Lampa.Input && Lampa.Input.edit) return Lampa.Input.edit({ title: title, value: '', free: true, nosave: true }, function (v) { done(v); });
+    } catch (e) {}
+    done(window.prompt ? window.prompt(title) : '');
+  }
+
+  function showKey(phrase, intro) {
+    var html = $(
+      '<div style="text-align:center;padding:1em 0">' +
+        (intro ? '<div style="margin-bottom:.6em">' + esc(intro) + '</div>' : '') +
+        '<div style="font-size:2.2em;font-weight:700;letter-spacing:.06em;white-space:nowrap;margin:.3em 0">' + esc(fmtKey(phrase)) + '</div>' +
+        '<div style="opacity:.7;margin-top:.8em">Введите этот ключ на остальных устройствах: Lampa GSync → Безопасность → Ключ синхронизации.<br>' +
+        'Храните его как пароль. Без ключа подделать плагин в таблице нельзя.</div>' +
+      '</div>'
+    );
+    Lampa.Modal.open({ title: 'Ключ синхронизации', html: html, size: 'medium', onBack: function () { Lampa.Modal.close(); backToSettings(); } });
+  }
+
+  async function createKey() {
+    if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    try {
+      var tk = await tableKeyCheck();
+      var go = async function () {
+        var phrase = genKey();
+        noty('Создание ключа…');
+        await sleep(50);
+        var key = deriveKey(phrase);
+        await writeSvc(tk.id, 'key_check', keyCheck(key));
+        saveKey(phrase, key);
+        log('Создан новый ключ синхронизации');
+        showKey(phrase, 'Ключ создан. Запишите его:');
+        syncAll({ silent: true }); // переподписать свои плагины
+      };
+      if (!tk.check) return go();
+      Lampa.Select.show({
+        title: 'В таблице уже есть ключ',
+        items: [
+          { title: 'Ввести существующий ключ', enter: true },
+          { title: 'Создать новый', subtitle: 'Старый перестанет действовать — на всех устройствах придётся ввести новый' }
+        ],
+        onSelect: function (it) { if (it.enter) enterKey(); else go(); },
+        onBack: backToSettings
+      });
+    } catch (e) { noty('Ключ: ' + msg(e)); }
+  }
+
+  function enterKey() {
+    if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    askText('Ключ синхронизации', async function (raw) {
+      var phrase = normKey(raw);
+      if (!phrase) return backToSettings();
+      if (phrase.length < KEY_MIN) { noty('Ключ слишком короткий: нужно не меньше ' + KEY_MIN + ' символов'); return backToSettings(); }
+      try {
+        noty('Проверка ключа…');
+        await sleep(50);
+        var key = deriveKey(phrase), kc = keyCheck(key), tk = await tableKeyCheck();
+        var accept = async function (overwrite) {
+          if (!tk.check || overwrite) await writeSvc(tk.id, 'key_check', kc);
+          saveKey(phrase, key);
+          log('Ключ синхронизации ' + (overwrite ? 'введён с перезаписью проверки' : 'введён'));
+          noty('Ключ принят');
+          backToSettings();
+          syncAll({ manual: true });
+        };
+        if (!tk.check || tk.check === kc) return accept(false);
+        Lampa.Select.show({
+          title: 'Ключ не совпадает с таблицей',
+          items: [
+            { title: 'Ввести заново', again: true },
+            { title: 'Использовать этот ключ', subtitle: 'Перезапишет проверку в таблице. Устройствам со старым ключом придётся ввести этот' }
+          ],
+          onSelect: function (it) { if (it.again) enterKey(); else accept(true); },
+          onBack: backToSettings
+        });
+      } catch (e) { noty('Ключ: ' + msg(e)); backToSettings(); }
+    });
+  }
+
+  function keyMenu() {
+    var has = !!localStorage.getItem('gsync_key');
+    var items = has
+      ? [{ title: 'Показать ключ', a: 'show' }, { title: 'Ввести другой ключ', a: 'enter' },
+         { title: 'Удалить ключ с этого устройства', subtitle: 'Плагины здесь перестанут синхронизироваться, пока ключ не введён снова', a: 'del' }]
+      : [{ title: 'Создать ключ', subtitle: 'На первом устройстве', a: 'create' },
+         { title: 'Ввести ключ', subtitle: 'На остальных устройствах', a: 'enter' }];
+    Lampa.Select.show({
+      title: 'Ключ синхронизации',
+      items: items,
+      onSelect: function (it) {
+        if (it.a === 'show') return showKey(localStorage.getItem('gsync_key_phrase') || '');
+        if (it.a === 'create') return createKey();
+        if (it.a === 'enter') return enterKey();
+        if (it.a === 'del') {
+          localStorage.removeItem('gsync_key'); localStorage.removeItem('gsync_key_phrase');
+          log('Ключ синхронизации удалён с устройства');
+          noty('Ключ удалён с этого устройства');
+          backToSettings();
+        }
+      },
+      onBack: backToSettings
+    });
   }
 
   /* ============================================================
@@ -1357,6 +1646,18 @@
     button('gsync_snap_save', 'Сохранить снимок', 'Полная копия состояния Lampa', saveSnapshot);
     button('gsync_snap_restore', 'Восстановить из снимка', '', restoreSnapshot);
     button('gsync_compact', 'Сжать таблицу', 'Убрать устаревшие версии строк', compactAll);
+
+    title('security', 'Безопасность');
+    button('gsync_key', 'Ключ синхронизации', '', keyMenu, function (item) {
+      var has = !!localStorage.getItem('gsync_key'), t;
+      if (!has) t = keyStatus === 'need'
+        ? '⚠ В таблице включена защита — введите ключ, иначе плагины здесь не синхронизируются'
+        : 'Не задан — плагины с других устройств не проверяются. Нажмите, чтобы создать или ввести';
+      else t = keyStatus === 'mismatch'
+        ? '⚠ Не совпадает с ключом в таблице — плагины здесь не синхронизируются'
+        : 'Задан — принимаются только подписанные этим ключом плагины';
+      item.find('.settings-param__descr').text(t);
+    });
 
     title('advanced', 'Расширенные');
     Lampa.SettingsApi.addParam({
