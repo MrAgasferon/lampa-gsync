@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.2.0
+ * Версия 0.2.1
  */
 (function () {
   'use strict';
@@ -47,7 +47,7 @@
   var DEFAULT_DENY = [
     /^player/, /^torrserver_url/, /^torrserver_login/, /^interface_size$/, /keyboard/i,
     /^proxy/, /^device/, /cache/i, /^activity$/, /^platform/, /^app_/, /^notice/,
-    /^recomends/, /^timeline/, /^screen/, /^navigation_type$/, /^start_time$/
+    /^recomends/, /^timeline/, /^timetable$/, /^screen/, /^navigation_type$/, /^start_time$/
   ];
 
   // Распределение «прочих» ключей по группам настроек
@@ -257,7 +257,8 @@
   var GROUPS = [
     bookmarksGroup,
     containerGroup({
-      id: 'progress', sheet: 'progress', title: 'Прогресс просмотра', descr: 'file_view: таймкоды и проценты',
+      id: 'progress', sheet: 'progress', cached: true, // Lampa держит прогресс в памяти — применять только при запуске
+      title: 'Прогресс просмотра', descr: 'file_view: таймкоды и проценты',
       header: ['item_id', 'storage_key', 'hash', 'percent', 'time', 'duration', 'json', 'updated_at', 'deleted', 'device'],
       claim: function (k) { return /^file_view(_.+)?$/.test(k); },
       cols: function (k, sub, x) { x = x || {}; return [k, sub, num(x.percent), num(x.time), num(x.duration)]; }
@@ -389,7 +390,7 @@
         noty('Вход выполнен: ' + (auth().email || 'Google'));
         log('Вход: ' + (auth().email || ''));
         authNotified = false;
-        try { sessionStorage.removeItem('gsync_reloaded'); } catch (e) {} // чтобы первая синхронизация могла применить закладки
+        JUST_RELOADED = false; // чтобы первая синхронизация могла применить закладки и прогресс
         syncAll({ startup: true });
         return;
       }
@@ -859,9 +860,19 @@
     return busy;
   }
 
-  function reloadedThisSession() { try { return sessionStorage.getItem('gsync_reloaded') === '1'; } catch (e) { return false; } }
+  // Метка одноразовая: «перезапущен» только тот запуск, который вызван перезапуском плагина.
+  // sessionStorage переживает F5, поэтому метку читаем и сразу удаляем при загрузке.
+  var JUST_RELOADED = (function () {
+    try {
+      var at = Number(sessionStorage.getItem('gsync_reload_at')) || 0;
+      sessionStorage.removeItem('gsync_reload_at');
+      sessionStorage.removeItem('gsync_reloaded'); // метка версии 0.2.0
+      return !!at && Date.now() - at < 2 * 60 * 1000;
+    } catch (e) { return false; }
+  })();
+  function reloadedThisSession() { return JUST_RELOADED; }
   function doReload(text) {
-    try { sessionStorage.setItem('gsync_reloaded', '1'); } catch (e) {}
+    try { sessionStorage.setItem('gsync_reload_at', String(Date.now())); } catch (e) {}
     noty(text);
     setTimeout(function () { location.reload(); }, 1500);
   }
