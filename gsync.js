@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.0
+ * Версия 0.3.1
  */
 (function () {
   'use strict';
@@ -1256,6 +1256,70 @@
     } catch (e) { noty('Не удалось восстановить: ' + msg(e)); }
   }
 
+  /* ============================================================
+   * Перезапись таблицы данными этого устройства
+   * mirror — остальные устройства становятся как это (лишнее у них удаляется)
+   * merge  — остальные добавляют своё, при конфликте побеждает это устройство
+   * ============================================================ */
+  async function resetTable(mode) {
+    if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    if (busy) { try { await busy; } catch (e) {} }
+    var ss, locked = false, done = false;
+    try {
+      ss = await ensureSpreadsheet();
+      var svc = await readSvc(ss.id), key = syncKey(), cub = cubYield();
+      var keyBlocks = !!svc.key_check && (!key || keyCheck(key) !== svc.key_check);
+      // только группы, которые это устройство само заполнит заново
+      var groups = GROUPS.filter(function (g) {
+        return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0) && !(keyBlocks && g.signed);
+      });
+      if (!groups.length) return noty('Нет групп для перезаписи');
+      if (!(await takeLock(ss.id))) return noty('Таблицей сейчас занято другое устройство — попробуйте через минуту');
+      locked = true;
+      var T = now();
+      // сначала горизонт (для «эталона»), потом очистка: параллельная синхронизация других устройств не вернёт старое
+      if (mode === 'mirror') for (var i = 0; i < groups.length; i++) await writeSvc(ss.id, 'purged_' + groups[i].id, T);
+      for (var j = 0; j < groups.length; j++) {
+        if (ss.titles.indexOf(groups[j].sheet) >= 0) await clearRange(ss.id, groups[j].sheet + '!A2:Z');
+      }
+      // Локально всё текущее состояние уходит в таблицу как свежая правка
+      var touches = lsGet('gsync_touch', {}) || {};
+      groups.forEach(function (g) {
+        localStorage.removeItem('gsync_shadow_' + g.id);
+        lsSet('gsync_inited_' + g.id, true);
+        g.read().forEach(function (p) { delete touches[g.keyOf(p[0])]; });
+      });
+      lsSet('gsync_touch', touches);
+      var skipped = GROUPS.filter(function (g) { return groupEnabled(g.id) && groups.indexOf(g) < 0; }).map(function (g) { return g.title; });
+      log('Таблица перезаписана с этого устройства (' + (mode === 'mirror' ? 'эталон' : 'слияние') + ')' + (skipped.length ? '; не тронуты: ' + skipped.join(', ') : ''));
+      done = true;
+    } catch (e) { noty('Перезапись: ' + msg(e)); }
+    finally { if (locked) await releaseLock(ss.id); }
+    if (done) await syncAll({ manual: true });
+  }
+
+  function resetMenu() {
+    if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    Lampa.Select.show({
+      title: 'Перезаписать таблицу данными этого устройства',
+      items: [
+        { title: 'Эталон', subtitle: 'Остальные устройства станут как это: лишние закладки, таймкоды и настройки на них удалятся', mode: 'mirror' },
+        { title: 'Слияние', subtitle: 'При конфликтах побеждает это устройство, но остальные вернут в таблицу то, чего здесь нет', mode: 'merge' },
+        { title: 'Отмена' }
+      ],
+      onSelect: function (it) {
+        if (!it.mode) return backToSettings();
+        Lampa.Select.show({
+          title: 'Очистить таблицу и записать данные этого устройства (' + it.title.toLowerCase() + ')?',
+          items: [{ title: 'Да, перезаписать', yes: true }, { title: 'Отмена' }],
+          onSelect: function (c) { backToSettings(); if (c.yes) resetTable(it.mode); },
+          onBack: backToSettings
+        });
+      },
+      onBack: backToSettings
+    });
+  }
+
   async function compactAll() {
     if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
     var ss;
@@ -1646,6 +1710,7 @@
     button('gsync_snap_save', 'Сохранить снимок', 'Полная копия состояния Lampa', saveSnapshot);
     button('gsync_snap_restore', 'Восстановить из снимка', '', restoreSnapshot);
     button('gsync_compact', 'Сжать таблицу', 'Убрать устаревшие версии строк', compactAll);
+    button('gsync_reset', 'Перезаписать таблицу с этого устройства', 'Очистить таблицу и залить данные этого устройства', resetMenu);
 
     title('security', 'Безопасность');
     button('gsync_key', 'Ключ синхронизации', '', keyMenu, function (item) {
