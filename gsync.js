@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.1
+ * Версия 0.3.2
  */
 (function () {
   'use strict';
@@ -76,6 +76,19 @@
   function num(x) { return typeof x === 'number' ? x : ''; }
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function msg(e) { return (e && e.message) || String(e); }
+  // Ссылка плагина для сравнения: без схемы, слэша на конце, параметров кэша; домен — без учёта регистра
+  function normUrl(u) {
+    u = String(u || '').trim().replace(/^https?:\/\//i, '').replace(/#.*$/, '');
+    var q = u.indexOf('?'), path = q < 0 ? u : u.slice(0, q), query = q < 0 ? '' : u.slice(q + 1);
+    var slash = path.indexOf('/');
+    path = (slash < 0 ? path.toLowerCase() : path.slice(0, slash).toLowerCase() + path.slice(slash)).replace(/\/+$/, '');
+    query = query.split('&').filter(function (kv) { return kv && !/^(v|ver|version|_|t|nocache|cache)=/i.test(kv); }).join('&');
+    return path + (query ? '?' + query : '');
+  }
+  function pluginNorm(v) {
+    var o = safeParse(v);
+    return normUrl(typeof o === 'string' ? o : (o && o.url) || '');
+  }
   function hash(s) { var h = 5381, i = s.length; while (i) h = (h * 33) ^ s.charCodeAt(--i); return (h >>> 0).toString(36) + ':' + s.length; }
   function noty(t) { try { Lampa.Noty.show(t); } catch (e) { console.log('[gsync]', t); } }
   function fmtDate(t) { var d = new Date(Number(t)); function p(n) { return n < 10 ? '0' + n : n; } return p(d.getDate()) + '.' + p(d.getMonth() + 1) + '.' + d.getFullYear() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()); }
@@ -391,6 +404,7 @@
       descr: 'Установленные плагины. Новые с других устройств — с выбором галочками',
       claim: function (k) { return k === 'plugins'; },
       confirm: true,                                                          // добавления/удаления — через диалог
+      norm: pluginNorm,                                                       // сравнение ссылок без мелочей — защита от дублей
       skip: function () { return lsGet('gsync_plugins_declined', {}) || {}; } // отклонённые на этом устройстве
     }),
     kvGroup('plugin_settings', 'Настройки плагинов', 'Всё остальное, кроме исключений')
@@ -806,8 +820,11 @@
     }
     var remote = reduceRows(g, rows);
     Object.keys(skip).forEach(function (id) { delete remote[id]; });
-    var local = [], kept = [];
-    g.read().forEach(function (p) { (skip[p[0]] ? kept : local).push(p); });
+    var local = [], kept = [], localNorms = {};
+    g.read().forEach(function (p) {
+      (skip[p[0]] ? kept : local).push(p);
+      if (g.norm && p[1].v != null) localNorms[g.norm(p[1].v)] = p[0];
+    });
     var n = local.length, state = {}, present = {}, synced = {};
 
     // 1. Локальные изменения относительно тени (последнего подтверждённого таблицей состояния)
@@ -855,7 +872,12 @@
       if (dir === 'push') return;
       if (!applyRemote) { if (l) l.dirty = false; deferred++; return; }
       if (g.confirm) {
-        if ((!l || l.d) && !r.d) { pending.add.push({ id: id, v: r.v, t: r.t }); return; }
+        if ((!l || l.d) && !r.d) {
+          var twin = g.norm && localNorms[g.norm(r.v)];
+          if (twin && twin !== id) return; // уже стоит под чуть другой ссылкой — не предлагать
+          pending.add.push({ id: id, v: r.v, t: r.t });
+          return;
+        }
         if (r.d && l && !l.d) { l.dirty = false; pending.del.push({ id: id, v: l.v, t: r.t }); return; }
       }
       accept(id, r, l);
@@ -1165,6 +1187,14 @@
     lsSet('gsync_plugins_declined', declined);
 
     var entries = g.read().filter(function (p) { return !del[p[0]]; }).map(function (p) { return { id: p[0], v: p[1].v }; });
+    var have = {};
+    entries.forEach(function (e) { have[g.norm ? g.norm(e.v) : e.id] = true; });
+    add = add.filter(function (x) {
+      var k = g.norm ? g.norm(x.v) : x.id;
+      if (have[k]) return false; // такой плагин уже есть в списке
+      have[k] = true;
+      return true;
+    });
     add.forEach(function (x) { entries.push({ id: x.id, v: x.v }); });
     g.write(entries, []);
 
@@ -1474,6 +1504,33 @@
     });
   }
 
+  /* ---------- Элементы синхронизации: группы и «Уступать CUB» ---------- */
+  function setGroup(id, on) {
+    localStorage.setItem('gsync_g_' + id, String(!!on));
+    if (!on) { localStorage.removeItem('gsync_shadow_' + id); localStorage.removeItem('gsync_inited_' + id); }
+    markCfgChanged();
+  }
+
+  function openItems(focus) {
+    var items = GROUPS.map(function (g) {
+      var on = groupEnabled(g.id), cubbed = on && CUB_GROUPS.indexOf(g.id) >= 0 && cubYield();
+      return {
+        title: (on ? '☑ ' : '☐ ') + g.title,
+        subtitle: g.descr + (cubbed ? ' · сейчас пропускается: выполнен вход в CUB' : ''),
+        group: g.id, selected: g.id === focus
+      };
+    });
+    Lampa.Select.show({
+      title: 'Элементы синхронизации',
+      items: items,
+      onSelect: function (it) {
+        setGroup(it.group, !groupEnabled(it.group));
+        openItems(it.group);
+      },
+      onBack: backToSettings
+    });
+  }
+
   /* ---------- Исключения: группировка и описания ключей ---------- */
 
   // Описания известных ключей Lampa. Для ключей сторонних плагинов описания нет —
@@ -1680,15 +1737,10 @@
     });
 
     title('groups', 'Что синхронизировать');
-    GROUPS.forEach(function (g) {
-      trigger('gsync_g_' + g.id, g.title, g.descr, DEFAULT_GROUPS[g.id], function () {
-        if (!groupEnabled(g.id)) { localStorage.removeItem('gsync_shadow_' + g.id); localStorage.removeItem('gsync_inited_' + g.id); }
-        markCfgChanged();
-      }, function (item) {
-        if (CUB_GROUPS.indexOf(g.id) >= 0 && cubYield()) {
-          item.find('.settings-param__descr').text(g.descr + ' · Сейчас пропускается: выполнен вход в CUB');
-        }
-      });
+    button('gsync_items', 'Элементы синхронизации', '', function () { openItems(); }, function (item) {
+      var on = GROUPS.filter(function (g) { return groupEnabled(g.id); }).length;
+      item.find('.settings-param__descr').text('Включено ' + on + ' из ' + GROUPS.length +
+        (cubYield() ? ' · закладки и прогресс сейчас уступлены CUB' : ''));
     });
     trigger('gsync_cub_yield', 'Уступать CUB (для этого устройства)',
       'Если выполнен вход в CUB, закладки и прогресс синхронизирует CUB, а GSync их пропускает — иначе две системы перетирают друг друга', true);
