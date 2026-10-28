@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.2
+ * Версия 0.3.4
  */
 (function () {
   'use strict';
@@ -143,6 +143,30 @@
     return !!(a && typeof a === 'object' && a.token) && boolSetting('account_use', true);
   }
   function cubYield() { return boolSetting('gsync_cub_yield', true) && cubActive(); }
+
+  /* ---------- Другие синхронизации: CUB и серверная синхронизация Lampac (ByLampa) ---------- */
+  // Плагины синхронизации Lampac ставят признаки при запуске — только если сервер их подгрузил
+  function lampacSync() {
+    var full = !!window.sync_init && !window.sync_disable; // sync.js: закладки, таймкоды, отметки
+    var g = [];
+    if (full || window.lampacBookmarkSyncInitialized) g.push('bookmarks');
+    if (full || window.lampac_timecode_plugin) g.push('progress');
+    if (full) g.push('views');
+    return g;
+  }
+  // Какие группы и кому уступлены на этом устройстве: { bookmarks: 'CUB', progress: 'ByLampa', ... }
+  function yielded() {
+    var out = {};
+    if (!boolSetting('gsync_cub_yield', true)) return out;
+    lampacSync().forEach(function (id) { out[id] = 'ByLampa'; });
+    if (cubActive()) CUB_GROUPS.forEach(function (id) { out[id] = out[id] ? out[id] + ', CUB' : 'CUB'; });
+    return out;
+  }
+  function yieldedText(y) {
+    var by = {};
+    Object.keys(y).forEach(function (id) { (by[y[id]] = by[y[id]] || []).push(GROUP_BY_ID[id].title.toLowerCase()); });
+    return Object.keys(by).map(function (who) { return by[who].join(', ') + ' — ' + who; }).join('; ');
+  }
 
   /* ============================================================
    * Криптография: SHA-256 / HMAC / PBKDF2 на чистом JS
@@ -747,9 +771,8 @@
     var groups = {};
     GROUPS.forEach(function (g) { groups[g.id] = groupEnabled(g.id); });
     return {
-      groups: groups, overrides: overrides(), mode: mode(),
-      progress_pause: boolSetting('gsync_progress_pause', true),
-      reload: boolSetting('gsync_reload', true)
+      groups: groups, overrides: overrides(),
+      snap_keep: snapKeep()
     };
   }
   function applySharedCfg(c) {
@@ -761,9 +784,8 @@
       if (was && !c.groups[id]) { localStorage.removeItem('gsync_shadow_' + id); localStorage.removeItem('gsync_inited_' + id); }
     });
     if (c.overrides) lsSet('gsync_overrides', c.overrides);
-    if (c.mode) localStorage.setItem('gsync_mode', c.mode);
-    if (c.progress_pause !== undefined) localStorage.setItem('gsync_progress_pause', String(!!c.progress_pause));
-    if (c.reload !== undefined) localStorage.setItem('gsync_reload', String(!!c.reload));
+    // mode / progress_pause / reload — с версии 0.3.4 настройки устройства, из таблицы не применяются
+    if (c.snap_keep !== undefined) localStorage.setItem('gsync_snap_keep', String(Number(c.snap_keep) || 0));
     restartTimers();
   }
   function markCfgChanged() { lsSet('gsync_cfg_t', now()); }
@@ -1008,7 +1030,7 @@
   /* ============================================================
    * Полный цикл синхронизации
    * ============================================================ */
-  var busy = null, again = false, authNotified = false, cubNoted = false, keyNoted = false, badSigNoted = false;
+  var busy = null, again = false, authNotified = false, yieldNoted = '', keyNoted = false, badSigNoted = false;
 
   function syncAll(opts) {
     opts = opts || {};
@@ -1083,10 +1105,10 @@
       log(km); noty('Lampa GSync: ' + km);
     }
 
-    var cub = cubYield();
-    if (cub && !cubNoted) { log('Вход в CUB: закладки и прогресс синхронизирует CUB, GSync их пропускает'); cubNoted = true; }
+    var yl = yielded(), ylText = yieldedText(yl);
+    if (ylText && ylText !== yieldNoted) { log('Уступлено другим синхронизациям: ' + ylText); yieldNoted = ylText; }
     var groups = GROUPS.filter(function (g) {
-      return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0) && !(skipPlugins && g.signed);
+      return groupEnabled(g.id) && !yl[g.id] && !(skipPlugins && g.signed);
     });
     if (!groups.length) { log('Нет групп для синхронизации'); return; }
     await ensureSheets(ss, groups.map(function (g) { return g.sheet; }));
@@ -1226,33 +1248,117 @@
       var now = Date.now(), sid = 'snap-' + now.toString(36);
       await appendRows(ss.id, 'snapshots', chunks.map(function (c, n) { return [sid, n, chunks.length, c, now, deviceName()]; }));
       log('Снимок сохранён: ' + Math.round(s.length / 1024) + ' КБ');
-      noty('Снимок сохранён (' + Math.round(s.length / 1024) + ' КБ)');
+      var pruned = await pruneSnapshots(ss);
+      noty('Снимок сохранён (' + Math.round(s.length / 1024) + ' КБ)' + (pruned ? '. Удалено старых: ' + pruned : ''));
     } catch (e) { noty('Снимок: ' + msg(e)); log('Снимок: ошибка ' + msg(e)); }
+  }
+
+  /* ---------- Список, удаление и автоочистка снимков ---------- */
+  function snapKeep() { return Number(localStorage.getItem('gsync_snap_keep') || 0) || 0; } // 0 — хранить все
+
+  function parseSnaps(rows) {
+    var snaps = {};
+    rows.forEach(function (r) {
+      var id = r[0]; if (!id) return;
+      var s = snaps[id] = snaps[id] || { id: id, chunks: {}, total: Number(r[2]) || 0, t: Number(r[4]) || 0, device: r[5] || '', size: 0 };
+      var c = String(r[3] || '');
+      s.chunks[Number(r[1])] = c;
+      s.size += c.length;
+    });
+    return Object.keys(snaps).map(function (k) {
+      var x = snaps[k]; x.ok = Object.keys(x.chunks).length === x.total; return x;
+    }).sort(function (a, b) { return b.t - a.t; });
+  }
+
+  async function loadSnaps() {
+    var ss = await ensureSpreadsheet();
+    if (ss.titles.indexOf('snapshots') < 0) return { ss: ss, list: [] };
+    return { ss: ss, list: parseSnaps((await batchGet(ss.id, ['snapshots!A2:F']))[0]) };
+  }
+
+  // Удаляет снимки по id. Лист перечитывается под блокировкой: снимок, сохранённый другим устройством в этот момент, не пропадёт
+  async function deleteSnaps(ss, ids) {
+    if (!(await takeLock(ss.id))) throw new Error('таблицей сейчас занято другое устройство — попробуйте через минуту');
+    try {
+      var rows = (await batchGet(ss.id, ['snapshots!A2:F']))[0];
+      var keep = rows.filter(function (r) { return r[0] && !ids[r[0]]; }).map(function (r) { return pad(r, SNAP_HEADER.length); });
+      await rewriteSheet(ss.id, 'snapshots', keep, 'F', rows.length);
+    } finally { await releaseLock(ss.id); }
+  }
+
+  async function pruneSnapshots(ss) {
+    var n = snapKeep();
+    if (!n) return 0;
+    var list = parseSnaps((await batchGet(ss.id, ['snapshots!A2:F']))[0]);
+    if (list.length <= n) return 0;
+    var ids = {};
+    list.slice(n).forEach(function (x) { ids[x.id] = true; });
+    await deleteSnaps(ss, ids);
+    log('Автоочистка снимков: удалено ' + Object.keys(ids).length + ', осталось ' + n);
+    return Object.keys(ids).length;
+  }
+
+  async function manageSnapshots() {
+    if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    var data;
+    try { data = await loadSnaps(); } catch (e) { return noty('Снимки: ' + msg(e)); }
+    if (!data.list.length) return noty('Снимков пока нет');
+    var marked = {};
+
+    function render(focus) {
+      var n = Object.keys(marked).length;
+      var items = [{
+        title: 'Удалить отмеченные (' + n + ')',
+        subtitle: n ? 'Отмеченные снимки будут удалены из таблицы без возможности восстановления' : 'Отметьте снимки ниже',
+        del: true
+      }];
+      data.list.forEach(function (x, i) {
+        items.push({
+          title: (marked[x.id] ? '☑ ' : '☐ ') + fmtDate(x.t) + ' — ' + x.device,
+          subtitle: Math.round(x.size / 1024) + ' КБ' + (x.ok ? '' : ' · повреждён') + (i === 0 ? ' · последний' : ''),
+          snap: x, selected: x.id === focus
+        });
+      });
+      Lampa.Select.show({
+        title: 'Снимки: ' + data.list.length,
+        items: items,
+        onSelect: function (it) {
+          if (it.del) {
+            if (!n) return render();
+            return Lampa.Select.show({
+              title: 'Удалить снимков: ' + n + '?',
+              items: [{ title: 'Да, удалить', yes: true }, { title: 'Отмена' }],
+              onSelect: async function (c) {
+                if (!c.yes) return render();
+                backToSettings();
+                try {
+                  await deleteSnaps(data.ss, marked);
+                  log('Удалено снимков: ' + n);
+                  noty('Удалено снимков: ' + n);
+                } catch (e) { noty('Снимки: ' + msg(e)); }
+              },
+              onBack: function () { render(); }
+            });
+          }
+          if (marked[it.snap.id]) delete marked[it.snap.id]; else marked[it.snap.id] = true;
+          render(it.snap.id);
+        },
+        onBack: backToSettings
+      });
+    }
+    render();
   }
 
   async function restoreSnapshot() {
     if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
-    var rows;
-    try {
-      var ss = await ensureSpreadsheet();
-      if (ss.titles.indexOf('snapshots') < 0) return noty('Снимков пока нет');
-      rows = (await batchGet(ss.id, ['snapshots!A2:F']))[0];
-    } catch (e) { return noty('Снимки: ' + msg(e)); }
-
-    var snaps = {};
-    rows.forEach(function (r) {
-      var id = r[0]; if (!id) return;
-      var s = snaps[id] = snaps[id] || { id: id, chunks: {}, total: Number(r[2]) || 0, t: Number(r[4]) || 0, device: r[5] || '' };
-      s.chunks[Number(r[1])] = String(r[3] || '');
-    });
-    var list = Object.keys(snaps).map(function (k) { return snaps[k]; }).sort(function (a, b) { return b.t - a.t; });
+    var list;
+    try { list = (await loadSnaps()).list; } catch (e) { return noty('Снимки: ' + msg(e)); }
     if (!list.length) return noty('Снимков пока нет');
 
     Lampa.Select.show({
       title: 'Восстановить снимок',
       items: list.map(function (s) {
-        var ok = Object.keys(s.chunks).length === s.total;
-        return { title: fmtDate(s.t) + ' — ' + s.device, subtitle: ok ? (s.total + ' фрагм.') : 'повреждён', snap: s, ghost: !ok };
+        return { title: fmtDate(s.t) + ' — ' + s.device, subtitle: s.ok ? Math.round(s.size / 1024) + ' КБ' : 'повреждён', snap: s, ghost: !s.ok };
       }),
       onSelect: function (it) {
         if (it.ghost) return noty('Снимок повреждён');
@@ -1297,11 +1403,11 @@
     var ss, locked = false, done = false;
     try {
       ss = await ensureSpreadsheet();
-      var svc = await readSvc(ss.id), key = syncKey(), cub = cubYield();
+      var svc = await readSvc(ss.id), key = syncKey(), yl = yielded();
       var keyBlocks = !!svc.key_check && (!key || keyCheck(key) !== svc.key_check);
       // только группы, которые это устройство само заполнит заново
       var groups = GROUPS.filter(function (g) {
-        return groupEnabled(g.id) && !(cub && CUB_GROUPS.indexOf(g.id) >= 0) && !(keyBlocks && g.signed);
+        return groupEnabled(g.id) && !yl[g.id] && !(keyBlocks && g.signed);
       });
       if (!groups.length) return noty('Нет групп для перезаписи');
       if (!(await takeLock(ss.id))) return noty('Таблицей сейчас занято другое устройство — попробуйте через минуту');
@@ -1513,10 +1619,10 @@
 
   function openItems(focus) {
     var items = GROUPS.map(function (g) {
-      var on = groupEnabled(g.id), cubbed = on && CUB_GROUPS.indexOf(g.id) >= 0 && cubYield();
+      var on = groupEnabled(g.id), who = on && yielded()[g.id];
       return {
         title: (on ? '☑ ' : '☐ ') + g.title,
-        subtitle: g.descr + (cubbed ? ' · сейчас пропускается: выполнен вход в CUB' : ''),
+        subtitle: g.descr + (who ? ' · сейчас уступлено: ' + who : ''),
         group: g.id, selected: g.id === focus
       };
     });
@@ -1739,20 +1845,24 @@
     title('groups', 'Что синхронизировать');
     button('gsync_items', 'Элементы синхронизации', '', function () { openItems(); }, function (item) {
       var on = GROUPS.filter(function (g) { return groupEnabled(g.id); }).length;
-      item.find('.settings-param__descr').text('Включено ' + on + ' из ' + GROUPS.length +
-        (cubYield() ? ' · закладки и прогресс сейчас уступлены CUB' : ''));
+      var yt = yieldedText(yielded());
+      item.find('.settings-param__descr').text('Включено ' + on + ' из ' + GROUPS.length + (yt ? ' · уступлено: ' + yt : ''));
     });
-    trigger('gsync_cub_yield', 'Уступать CUB (для этого устройства)',
-      'Если выполнен вход в CUB, закладки и прогресс синхронизирует CUB, а GSync их пропускает — иначе две системы перетирают друг друга', true);
+    trigger('gsync_cub_yield', 'Уступать другим синхронизациям',
+      'Если на устройстве работает синхронизация CUB или ByLampa (сервер Lampac), GSync пропускает те же данные — иначе системы перетирают друг друга', true,
+      null, function (item) {
+        var yt = yieldedText(yielded());
+        if (yt) item.find('.settings-param__descr').text('Сейчас уступлено: ' + yt);
+      });
 
-    title('mode', 'Режим');
+    title('mode', 'Режим (для этого устройства)');
     select('gsync_mode', 'Когда синхронизировать',
       { auto: 'При запуске и изменениях', start: 'Только при запуске', manual: 'Вручную' }, 'auto',
-      function () { markCfgChanged(); restartTimers(); });
-    select('gsync_dir', 'Направление (для этого устройства)',
+      function () { restartTimers(); });
+    select('gsync_dir', 'Направление',
       { both: 'В обе стороны', push: 'Только отправлять', pull: 'Только получать' }, 'both');
-    trigger('gsync_progress_pause', 'Прогресс — только на паузе и выходе', 'Не отправлять таймкоды во время просмотра', true, markCfgChanged);
-    trigger('gsync_reload', 'Перезапуск после получения изменений', 'При запуске, если пришли закладки, плагины или настройки', true, markCfgChanged);
+    trigger('gsync_progress_pause', 'Прогресс — только на паузе и выходе', 'Не отправлять таймкоды во время просмотра', true);
+    trigger('gsync_reload', 'Перезапуск после получения изменений', 'При запуске, если пришли настройки. Закладки, прогресс и плагины перезапускают всегда', true);
 
     title('actions', 'Действия');
     button('gsync_now', 'Синхронизировать сейчас', '', function () {
@@ -1761,6 +1871,10 @@
     });
     button('gsync_snap_save', 'Сохранить снимок', 'Полная копия состояния Lampa', saveSnapshot);
     button('gsync_snap_restore', 'Восстановить из снимка', '', restoreSnapshot);
+    button('gsync_snap_manage', 'Удалить снимки', 'Выбрать снимки для удаления', manageSnapshots);
+    select('gsync_snap_keep', 'Хранить снимков',
+      { '0': 'Все', '1': 'Только последний', '3': 'Последние 3', '5': 'Последние 5', '10': 'Последние 10' }, '0',
+      markCfgChanged);
     button('gsync_compact', 'Сжать таблицу', 'Убрать устаревшие версии строк', compactAll);
     button('gsync_reset', 'Перезаписать таблицу с этого устройства', 'Очистить таблицу и залить данные этого устройства', resetMenu);
 
@@ -1846,7 +1960,7 @@
     addSettings();
     bindListeners();
     restartTimers();
-    if (isLoggedIn() && mode() !== 'manual') setTimeout(function () { syncAll({ startup: true, silent: true }); }, 1500);
+    if (isLoggedIn() && mode() !== 'manual') setTimeout(function () { syncAll({ startup: true, silent: true }); }, 3000); // Lampac-плагины синхронизации успевают объявиться
   }
 
   if (window.appready) start();
