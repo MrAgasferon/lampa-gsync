@@ -1,4 +1,4 @@
-<img src="logo-512.png" width="96" alt="Lampa GSync">
+<center><img src="logo-512.png" width="96" alt="Lampa GSync"></center>
 
 # Lampa GSync — синхронизация Lampa / ByLampa через Google Таблицу
 
