@@ -1,3 +1,5 @@
+<img src="logo-512.png" width="96" alt="Lampa GSync">
+
 # Lampa GSync — синхронизация Lampa / ByLampa через Google Таблицу
 
 Lampa GSync — плагин для Lampa / ByLampa, синхронизирующий закладки, прогресс просмотра и настройки между устройствами пользователя через Google Таблицу на его собственном Google Диске.
