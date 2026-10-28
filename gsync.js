@@ -1627,7 +1627,7 @@
       };
     });
     Lampa.Select.show({
-      title: 'Элементы синхронизации',
+      title: 'Элементы синхронизации (общее для всех устройств)',
       items: items,
       onSelect: function (it) {
         setGroup(it.group, !groupEnabled(it.group));
@@ -1746,7 +1746,7 @@
     var sections = exclusionSections();
     if (!sections.length) return noty('Нет ключей для настройки');
     Lampa.Select.show({
-      title: 'Исключения',
+      title: 'Исключения (список общий для всех устройств)',
       items: sections.map(function (s) {
         var loc = s.keys.filter(isLocalOnly).length;
         return {
@@ -1778,7 +1778,7 @@
       });
     });
     Lampa.Select.show({
-      title: s.info.title + ' (✗ — только на этом устройстве)',
+      title: s.info.title + ' (✗ — значение не покидает устройство)',
       items: items,
       onSelect: function (it) {
         if (it.all) s.keys.forEach(function (k) { setLocal(k, !allLocal); });
@@ -1827,9 +1827,9 @@
         onRender: render
       });
     }
-    function select(name, label, values, def, fn) {
+    function select(name, label, values, def, fn, descr) {
       Lampa.SettingsApi.addParam({
-        component: C, param: { name: name, type: 'select', values: values, default: def }, field: { name: label },
+        component: C, param: { name: name, type: 'select', values: values, default: def }, field: { name: label, description: descr || '' },
         onChange: function () { setTimeout(fn || function () {}, 0); }
       });
     }
@@ -1846,9 +1846,9 @@
     button('gsync_items', 'Элементы синхронизации', '', function () { openItems(); }, function (item) {
       var on = GROUPS.filter(function (g) { return groupEnabled(g.id); }).length;
       var yt = yieldedText(yielded());
-      item.find('.settings-param__descr').text('Включено ' + on + ' из ' + GROUPS.length + (yt ? ' · уступлено: ' + yt : ''));
+      item.find('.settings-param__descr').text('Включено ' + on + ' из ' + GROUPS.length + ' · общее для всех устройств' + (yt ? ' · уступлено: ' + yt : ''));
     });
-    trigger('gsync_cub_yield', 'Уступать другим синхронизациям',
+    trigger('gsync_cub_yield', 'Уступать другим синхронизациям (для этого устройства)',
       'Если на устройстве работает синхронизация CUB или ByLampa (сервер Lampac), GSync пропускает те же данные — иначе системы перетирают друг друга', true,
       null, function (item) {
         var yt = yieldedText(yielded());
@@ -1874,7 +1874,7 @@
     button('gsync_snap_manage', 'Удалить снимки', 'Выбрать снимки для удаления', manageSnapshots);
     select('gsync_snap_keep', 'Хранить снимков',
       { '0': 'Все', '1': 'Только последний', '3': 'Последние 3', '5': 'Последние 5', '10': 'Последние 10' }, '0',
-      markCfgChanged);
+      markCfgChanged, 'Старые сверх лимита удаляются при сохранении нового · общее для всех устройств');
     button('gsync_compact', 'Сжать таблицу', 'Убрать устаревшие версии строк', compactAll);
     button('gsync_reset', 'Перезаписать таблицу с этого устройства', 'Очистить таблицу и залить данные этого устройства', resetMenu);
 
@@ -1883,19 +1883,19 @@
       var has = !!localStorage.getItem('gsync_key'), t;
       if (!has) t = keyStatus === 'need'
         ? '⚠ В таблице включена защита — введите ключ, иначе плагины здесь не синхронизируются'
-        : 'Не задан — плагины с других устройств не проверяются. Нажмите, чтобы создать или ввести';
+        : 'Не задан — плагины с других устройств не проверяются. Защита включается для всех устройств сразу, ключ вводится на каждом';
       else t = keyStatus === 'mismatch'
         ? '⚠ Не совпадает с ключом в таблице — плагины здесь не синхронизируются'
-        : 'Задан — принимаются только подписанные этим ключом плагины';
+        : 'Задан — принимаются только подписанные этим ключом плагины. Защита действует на все устройства, ключ хранится на каждом';
       item.find('.settings-param__descr').text(t);
     });
 
     title('advanced', 'Расширенные');
     Lampa.SettingsApi.addParam({
       component: C, param: { name: 'gsync_device', type: 'input', values: '', placeholder: 'Например: tv-living', default: '' },
-      field: { name: 'Имя устройства', description: 'Пишется в колонку device' }
+      field: { name: 'Имя устройства', description: 'Для этого устройства. Пишется в колонку device' }
     });
-    button('gsync_exclusions', 'Исключения', 'Какие настройки остаются только на этом устройстве', function () { openExclusions(); });
+    button('gsync_exclusions', 'Исключения', 'Какие настройки не покидают устройство. Список общий для всех устройств', function () { openExclusions(); });
     button('gsync_log', 'Журнал', 'Последние синхронизации и ошибки', openLog);
     button('gsync_declined_reset', 'Отклонённые плагины', '', function () {
       var n = Object.keys(lsGet('gsync_plugins_declined', {}) || {}).length;
