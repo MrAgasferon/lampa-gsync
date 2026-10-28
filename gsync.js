@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.4
+ * Версия 0.3.5
  */
 (function () {
   'use strict';
@@ -1241,9 +1241,7 @@
     try {
       var ss = await ensureSpreadsheet();
       await ensureSheets(ss, ['snapshots']);
-      var dump = {};
-      allKeys().forEach(function (k) { if (!isHardDenied(k) && !/cache/i.test(k)) dump[k] = localStorage.getItem(k); });
-      var s = JSON.stringify({ v: 1, device: deviceName(), keys: dump }), chunks = [];
+      var s = JSON.stringify(makeDump()), chunks = [];
       for (var i = 0; i < s.length; i += CFG.CELL_LIMIT) chunks.push(s.slice(i, i + CFG.CELL_LIMIT));
       var now = Date.now(), sid = 'snap-' + now.toString(36);
       await appendRows(ss.id, 'snapshots', chunks.map(function (c, n) { return [sid, n, chunks.length, c, now, deviceName()]; }));
@@ -1373,23 +1371,80 @@
     });
   }
 
+  function makeDump() {
+    var dump = {};
+    allKeys().forEach(function (k) { if (!isHardDenied(k) && !/cache/i.test(k)) dump[k] = localStorage.getItem(k); });
+    return { v: 1, app: 'lampa-gsync', device: deviceName(), created_at: now(), keys: dump };
+  }
+
+  function applyDump(obj, when) {
+    if (!obj || typeof obj !== 'object' || !obj.keys || typeof obj.keys !== 'object') throw new Error('это не снимок Lampa GSync');
+    var same = obj.device === deviceName();
+    Object.keys(obj.keys).forEach(function (k) {
+      if (isHardDenied(k)) return;
+      if (!same && isLocalOnly(k)) return; // привязанное к устройству и исключения со снимка чужого устройства не переносим
+      if (typeof obj.keys[k] !== 'string') return;
+      localStorage.setItem(k, obj.keys[k]);
+      touch(k); // восстановленное считается свежей правкой и уйдёт в таблицу
+    });
+    // Сброс теней: восстановленное состояние уйдёт в таблицу как новое
+    GROUPS.forEach(function (g) { localStorage.removeItem('gsync_shadow_' + g.id); });
+    log('Восстановлен снимок от ' + fmtDate(when || obj.created_at || now()) + ' (' + (obj.device || '?') + ')');
+    noty('Снимок восстановлен — перезапуск…');
+    setTimeout(function () { location.reload(); }, 1200);
+  }
+
   function applySnapshot(s) {
     try {
       var data = '';
       for (var i = 0; i < s.total; i++) data += s.chunks[i];
-      var obj = JSON.parse(data), same = obj.device === deviceName();
-      Object.keys(obj.keys || {}).forEach(function (k) {
-        if (isHardDenied(k)) return;
-        if (!same && isLocalOnly(k)) return; // привязанное к устройству и твои исключения со снимка чужого устройства не переносим
-        localStorage.setItem(k, obj.keys[k]);
-        touch(k); // восстановленное считается свежей правкой и уйдёт в таблицу
-      });
-      // Сброс теней: восстановленное состояние уйдёт в таблицу как новое
-      GROUPS.forEach(function (g) { localStorage.removeItem('gsync_shadow_' + g.id); });
-      log('Восстановлен снимок от ' + fmtDate(s.t));
-      noty('Снимок восстановлен — перезапуск…');
-      setTimeout(function () { location.reload(); }, 1200);
+      applyDump(JSON.parse(data), s.t);
     } catch (e) { noty('Не удалось восстановить: ' + msg(e)); }
+  }
+
+  /* ---------- Снимок файлом: без Google, на само устройство ---------- */
+  function downloadSnapshot() {
+    try {
+      var text = JSON.stringify(makeDump());
+      var d = new Date(), p = function (n) { return n < 10 ? '0' + n : n; };
+      var name = 'lampa-gsync-' + deviceName().replace(/[^\w\-]+/g, '_') + '-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + '.json';
+      var blob = new Blob([text], { type: 'application/json' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = name;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      log('Снимок скачан файлом: ' + name + ' (' + Math.round(text.length / 1024) + ' КБ)');
+      noty('Файл ' + name + '. Если скачивание не началось — приложение его не поддерживает, сделайте это в браузере');
+    } catch (e) { noty('Не удалось скачать: ' + msg(e)); }
+  }
+
+  function restoreFromFile() {
+    try {
+      var input = document.createElement('input');
+      input.type = 'file'; input.accept = '.json,application/json';
+      input.onchange = function () {
+        var f = input.files && input.files[0];
+        if (!f) return;
+        var rd = new FileReader();
+        rd.onload = function () {
+          var obj;
+          try { obj = JSON.parse(String(rd.result)); } catch (e) { return noty('Файл не читается как JSON'); }
+          if (!obj || !obj.keys) return noty('Это не снимок Lampa GSync');
+          Lampa.Select.show({
+            title: 'Восстановить снимок ' + (obj.device || '') + (obj.created_at ? ' от ' + fmtDate(obj.created_at) : '') + '?',
+            items: [{ title: 'Восстановить и перезапустить', yes: true }, { title: 'Отмена' }],
+            onSelect: function (c) {
+              if (!c.yes) return backToSettings();
+              try { applyDump(obj); } catch (e) { noty('Не удалось восстановить: ' + msg(e)); }
+            },
+            onBack: backToSettings
+          });
+        };
+        rd.onerror = function () { noty('Не удалось прочитать файл'); };
+        rd.readAsText(f);
+      };
+      input.click();
+    } catch (e) { noty('Выбор файла недоступен в этом приложении: ' + msg(e)); }
   }
 
   /* ============================================================
@@ -1871,6 +1926,8 @@
     });
     button('gsync_snap_save', 'Сохранить снимок', 'Полная копия состояния Lampa', saveSnapshot);
     button('gsync_snap_restore', 'Восстановить из снимка', '', restoreSnapshot);
+    button('gsync_snap_file_save', 'Скачать снимок файлом', 'Копия на это устройство, без Google. В приложениях на ТВ может не работать', downloadSnapshot);
+    button('gsync_snap_file_load', 'Восстановить из файла', 'Из скачанного ранее файла .json', restoreFromFile);
     button('gsync_snap_manage', 'Удалить снимки', 'Выбрать снимки для удаления', manageSnapshots);
     select('gsync_snap_keep', 'Хранить снимков',
       { '0': 'Все', '1': 'Только последний', '3': 'Последние 3', '5': 'Последние 5', '10': 'Последние 10' }, '0',
