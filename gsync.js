@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.5
+ * Версия 0.3.6
  */
 (function () {
   'use strict';
@@ -95,6 +95,7 @@
   function backToSettings() { try { Lampa.Controller.toggle('settings_component'); } catch (e) {} }
 
   function boolSetting(name, def) { var v = localStorage.getItem(name); return v === null ? def : (v === 'true' || v === true); }
+  function syncEnabled() { return boolSetting('gsync_enabled', false); } // главный выключатель, для этого устройства
   function mode() { return localStorage.getItem('gsync_mode') || 'auto'; }        // auto | start | manual
   function direction() { return localStorage.getItem('gsync_dir') || 'both'; }    // both | push | pull
   function groupEnabled(id) { return boolSetting('gsync_g_' + id, DEFAULT_GROUPS[id]); }
@@ -542,7 +543,8 @@
         log('Вход: ' + (auth().email || ''));
         authNotified = false;
         JUST_RELOADED = false; // чтобы первая синхронизация могла применить закладки и прогресс
-        syncAll({ startup: true });
+        if (syncEnabled()) syncAll({ startup: true });
+        else noty('Чтобы начать, включите «Синхронизация» в Lampa GSync');
         return;
       }
       var err = p.json.error;
@@ -1034,6 +1036,10 @@
 
   function syncAll(opts) {
     opts = opts || {};
+    if (!syncEnabled()) {
+      if (opts.manual) noty('Синхронизация выключена — включите её в Lampa GSync → Синхронизация');
+      return Promise.resolve();
+    }
     if (busy) { again = true; return busy; }
     busy = doSync(opts).catch(function (e) {
       log('Ошибка: ' + msg(e));
@@ -1454,6 +1460,7 @@
    * ============================================================ */
   async function resetTable(mode) {
     if (!isLoggedIn()) return noty('Сначала войдите в аккаунт Google');
+    if (!syncEnabled()) return noty('Сначала включите «Синхронизация» — иначе таблица останется пустой');
     if (busy) { try { await busy; } catch (e) {} }
     var ss, locked = false, done = false;
     try {
@@ -1896,6 +1903,14 @@
         ? 'Подключено: ' + (auth().email || 'Google') + (last ? ' · синхронизировано ' + fmtDate(last) : '')
         : 'Не подключено — нажмите, чтобы войти');
     });
+    trigger('gsync_enabled', 'Синхронизация', 'Для этого устройства', false, function () {
+      if (syncEnabled()) {
+        log('Синхронизация включена');
+        if (!isLoggedIn()) return noty('Синхронизация начнётся после входа в Google');
+        authNotified = false;
+        syncAll({ startup: true, manual: true });
+      } else log('Синхронизация выключена');
+    });
 
     title('groups', 'Что синхронизировать');
     button('gsync_items', 'Элементы синхронизации', '', function () { openItems(); }, function (item) {
@@ -2014,10 +2029,15 @@
    * ============================================================ */
   function start() {
     if (!localStorage.getItem('gsync_device')) localStorage.setItem('gsync_device', defaultDeviceName());
+    // До 0.3.6 выключателя не было: устройство, которое уже синхронизировалось, оставляем включённым
+    if (localStorage.getItem('gsync_enabled') === null && isLoggedIn() &&
+        GROUPS.some(function (g) { return localStorage.getItem('gsync_inited_' + g.id) !== null; })) {
+      localStorage.setItem('gsync_enabled', 'true');
+    }
     addSettings();
     bindListeners();
     restartTimers();
-    if (isLoggedIn() && mode() !== 'manual') setTimeout(function () { syncAll({ startup: true, silent: true }); }, 3000); // Lampac-плагины синхронизации успевают объявиться
+    if (isLoggedIn() && syncEnabled() && mode() !== 'manual') setTimeout(function () { syncAll({ startup: true, silent: true }); }, 3000); // Lampac-плагины синхронизации успевают объявиться
   }
 
   if (window.appready) start();
