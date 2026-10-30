@@ -2,7 +2,7 @@
  * GSync — синхронизация Lampa / ByLampa через Google Таблицу пользователя
  * Авторизация: OAuth 2.0 Device Flow (google.com/device), scope drive.file
  * Каждый пользователь — своя таблица на своём Google Диске.
- * Версия 0.3.6
+ * Версия 0.3.7
  */
 (function () {
   'use strict';
@@ -47,7 +47,10 @@
   var DEFAULT_DENY = [
     /^player/, /^torrserver_url/, /^torrserver_login/, /^interface_size$/, /keyboard/i,
     /^proxy/, /^device/, /cache/i, /^activity$/, /^platform/, /^app_/, /^notice/,
-    /^recomends/, /^timeline/, /^timetable$/, /^screen/, /^navigation_type$/, /^start_time$/
+    /^recomends/, /^timeline/, /^timetable$/, /^screen/, /^navigation_type$/, /^start_time$/,
+    // идентификаторы устройства, метрика, резервная копия списка плагинов (без подписи ключом)
+    /(^|_)(uid|unic_id|guid|device_id|device_uid|device_guid|installation_id)$/i, /^_ym/, /^metric_/, /^vast_device/,
+    /^pluginsBack$/
   ];
 
   // Распределение «прочих» ключей по группам настроек
@@ -867,6 +870,7 @@
     Object.keys(shadow).forEach(function (id) {
       if (present[id] || skip[id]) return;
       var s = shadow[id];
+      if (g.kind === 'kv' && isLocalOnly(id)) return; // стал локальным — забываем, удаление не рассылаем
       if (s.d) { if (T - s.t < CFG.TOMBSTONE_TTL_MS) state[id] = tomb(s.t); return; }
       if (g.kind === 'kv' && localStorage.getItem(id) !== null) return; // ключ стал локальным — у других не удаляем
       state[id] = { v: null, h: '', t: changedAt(id, s.t), d: true, cols: [], dirty: true };
@@ -998,6 +1002,7 @@
     var red = reduceRows(g, rows), H = g.header.length, horizon = now() - CFG.TOMBSTONE_TTL_MS;
     var keep = Object.keys(red).map(function (k) { return red[k]; })
       .filter(function (x) { return !(x.d && x.t < horizon); })
+      .filter(function (x) { return !(g.kind === 'kv' && isLocalOnly(String(x.raw[0]))); }) // помеченные локальными — из таблицы прочь
       .map(function (x) { return pad(x.raw, H); });
     // сначала горизонт очистки, потом удаление строк: устройства, не видевшие удаление, поймут, что элемент удалён
     await writeSvc(id, 'purged_' + g.id, horizon);
@@ -1006,7 +1011,7 @@
   }
 
   async function maybeCompact(id, results) {
-    var todo = results.filter(function (x) { return x.rowCount > Math.max(CFG.COMPACT_MIN_ROWS, x.r.live * 2); });
+    var todo = results.filter(function (x) { return x.hasLocal || x.rowCount > Math.max(CFG.COMPACT_MIN_ROWS, x.r.live * 2); });
     if (!todo.length || !(await takeLock(id))) return;
     try { for (var i = 0; i < todo.length; i++) await compactGroup(id, todo[i].g); }
     finally { await releaseLock(id); }
@@ -1127,7 +1132,8 @@
     var total = { pushed: 0, received: 0, deferred: 0 }, reloadCached = false, reloadSettings = false, results = [], pending = null;
     groups.forEach(function (g, i) {
       var r = syncGroup(g, data[i], ctx);
-      results.push({ g: g, r: r, rowCount: data[i].length + r.rows.length });
+      var hasLocal = g.kind === 'kv' && data[i].some(function (row) { return row[0] !== undefined && row[0] !== '' && isLocalOnly(String(row[0])); });
+      results.push({ g: g, r: r, rowCount: data[i].length + r.rows.length, hasLocal: hasLocal });
       total.pushed += r.rows.length; total.received += r.received; total.deferred += r.deferred;
       if (r.received && g.cached) reloadCached = true;
       if (r.received && g.kind === 'kv') reloadSettings = true;
