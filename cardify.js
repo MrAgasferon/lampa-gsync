@@ -19,7 +19,7 @@
 	// Константы
 	// ---------------------------------------------------------------------------
 
-	var VERSION = '2.1';
+	var VERSION = '2.2';
 	var MAX_TRAILER_HEIGHT = 1080;      // потолок качества фонового трейлера (высота кадра)
 	var TRAILER_START_TIMEOUT = 15000;  // мс ожидания старта видео, дальше — следующий ролик или слайдшоу
 	var MAX_TRAILER_CANDIDATES = 3;     // сколько найденных роликов пробовать по очереди
@@ -152,6 +152,7 @@
 	// ---------------------------------------------------------------------------
 
 	var searchProxy = '';
+	var rutubeUnreachable = false; // RUTUBE недоступен ни напрямую, ни через прокси — до перезагрузки не ищем
 
 	function searchTrailers(movie, isTv, onSuccess, onFail) {
 		var requests = [];
@@ -219,6 +220,13 @@
 			finished = true;
 			if (hit) onSuccess(cached[1]);
 			else onFail();
+			return abort;
+		}
+
+		if (rutubeUnreachable) {
+			log('trailer: RUTUBE недоступен в этой сессии — пропускаю поиск');
+			finished = true;
+			onFail();
 			return abort;
 		}
 
@@ -300,6 +308,7 @@
 			var query = cleanString([search, year, trailerTypes[index], isTv ? 'сезон 1' : ''].join(' '));
 			var url = 'https://rutube.ru/api/search/video/?query=' + encodeURIComponent(query) + '&format=json';
 			var net = request();
+			net.timeout(10000);
 
 			net.native(
 				searchProxy + url,
@@ -315,7 +324,11 @@
 						useProxy();
 						searchStep(index);
 					} else {
-						log('trailer: поиск RUTUBE не удался —', errInfo(xhr));
+						log('trailer: поиск RUTUBE не удался' + (searchProxy ? ' (через прокси)' : '') + ' —', errInfo(xhr));
+						if (searchProxy && xhr && xhr.status === 0) {
+							rutubeUnreachable = true;
+							log('trailer: RUTUBE недоступен ни напрямую, ни через прокси — до перезагрузки сразу слайдшоу');
+						}
 						networkFail();
 					}
 				}
@@ -487,9 +500,13 @@
 
 	// Как в плеере Lampa (HlsStream.shouldUseProgram): hls.js на Chrome > 120,
 	// по настройке «Программный» или когда встроенного HLS нет; Tizen/Orsay — встроенный
-	function preferHlsJs(nativeHls) {
+	function hlsJsAvailable() {
 		var Hls = window.Hls;
-		if (!Hls || typeof Hls.isSupported !== 'function' || !Hls.isSupported()) return false;
+		return !!Hls && typeof Hls.isSupported === 'function' && Hls.isSupported();
+	}
+
+	function preferHlsJs(nativeHls) {
+		if (!hlsJsAvailable()) return false;
 		if (Lampa.Platform.is('tizen') || Lampa.Platform.is('orsay')) return false;
 
 		var chrome = typeof Lampa.Platform.chromeVersion === 'function' ? Lampa.Platform.chromeVersion() : 0;
@@ -514,15 +531,19 @@
 
 		var nativeHls = !!(video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl'));
 		var mode = '';
+		var tried = {};
 
 		function fail(reason) {
 			if (dead) return;
 
-			// hls.js не смог (часто CORS на сегментах в браузере) — пробуем встроенный HLS
-			if (mode === 'hls.js' && !started && nativeHls) {
-				log('trailer: hls.js не смог (' + reason + '), пробую встроенный HLS');
-				attach('native');
-				return;
+			// Не стартовало — пробуем другой способ: hls.js ↔ встроенный HLS (каждый один раз)
+			if (!started) {
+				var alt = mode === 'hls.js' ? (nativeHls ? 'native' : '') : hlsJsAvailable() ? 'hls.js' : '';
+				if (alt && !tried[alt]) {
+					log('trailer: ' + mode + ' не смог (' + reason + '), пробую ' + alt);
+					attach(alt);
+					return;
+				}
 			}
 
 			log('trailer: видео не играет —', reason, '(' + mode + ')');
@@ -538,7 +559,15 @@
 				} catch (e) {}
 				hls = null;
 			}
-			mode = how;
+			var prev = mode;
+			mode = how; // до сброса src: события error от сброса не должны считаться ошибкой
+			tried[how] = true;
+			if (prev === 'native') {
+				try {
+					video.removeAttribute('src');
+					video.load();
+				} catch (e) {}
+			}
 			log('trailer: проигрываю через', how);
 
 			if (how === 'hls.js') {
