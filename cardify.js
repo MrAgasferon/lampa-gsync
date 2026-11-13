@@ -19,6 +19,7 @@
 	// Константы
 	// ---------------------------------------------------------------------------
 
+	var VERSION = '2.1';
 	var MAX_TRAILER_HEIGHT = 1080;      // потолок качества фонового трейлера (высота кадра)
 	var TRAILER_START_TIMEOUT = 15000;  // мс ожидания старта видео, дальше — следующий ролик или слайдшоу
 	var MAX_TRAILER_CANDIDATES = 3;     // сколько найденных роликов пробовать по очереди
@@ -58,6 +59,33 @@
 	// ---------------------------------------------------------------------------
 
 	function noop() {}
+
+	// Логи в консоль с префиксом Cardify — фильтр «Cardify» в DevTools
+	function log() {
+		var args = Array.prototype.slice.call(arguments);
+		args.unshift('Cardify');
+		try {
+			console.log.apply(console, args);
+		} catch (e) {}
+	}
+
+	function errInfo(xhr) {
+		if (!xhr) return 'no response';
+		return 'status ' + xhr.status + (xhr.status === 0 ? ' (CORS / сеть)' : '') + (xhr.decode_error ? ', ' + xhr.decode_error : '');
+	}
+
+	function isCorsBlocked(xhr) {
+		return !!xhr && xhr.status === 0 && xhr.readyState === 0 && !window.AndroidJS;
+	}
+
+	function useProxy() {
+		if (!searchProxy) {
+			searchProxy = Lampa.Storage.get('rutube_search_proxy', '') || DEFAULT_SEARCH_PROXY;
+			if (searchProxy.slice(-1) !== '/') searchProxy += '/';
+			log('RUTUBE: CORS в браузере, дальше через прокси', searchProxy);
+		}
+		return searchProxy;
+	}
 
 	function t(key) {
 		return Lampa.Lang.translate(key);
@@ -182,11 +210,15 @@
 			onFail();
 		}
 
+		log('trailer: ищу', '«' + search + '»', year || '(без года)', type);
+
 		var cached = cacheGet(cacheKey);
 		if (cached) {
-			if (cached[0] && cached[1] && cached[1].length) onSuccess(cached[1]);
-			else onFail();
+			var hit = cached[0] && cached[1] && cached[1].length;
+			log('trailer: из sessionStorage —', hit ? cached[1].length + ' шт.' : 'ранее не найден');
 			finished = true;
+			if (hit) onSuccess(cached[1]);
+			else onFail();
 			return abort;
 		}
 
@@ -272,17 +304,18 @@
 			net.native(
 				searchProxy + url,
 				function (data) {
-					var list = data && data.results && data.results.length ? filterResults(data.results, query) : [];
+					var raw = data && data.results ? data.results.length : 0;
+					var list = raw ? filterResults(data.results, query) : [];
+					log('trailer: поиск «' + query + '» —', raw + ' роликов, подходит ' + list.length);
 					if (list.length) done(list);
 					else searchStep(index + 1);
 				},
 				function (xhr) {
-					var corsBlocked = !!xhr && xhr.status === 0 && xhr.readyState === 0;
-					if (!searchProxy && !window.AndroidJS && corsBlocked) {
-						searchProxy = Lampa.Storage.get('rutube_search_proxy', '') || DEFAULT_SEARCH_PROXY;
-						if (searchProxy.slice(-1) !== '/') searchProxy += '/';
+					if (!searchProxy && isCorsBlocked(xhr)) {
+						useProxy();
 						searchStep(index);
 					} else {
+						log('trailer: поиск RUTUBE не удался —', errInfo(xhr));
 						networkFail();
 					}
 				}
@@ -295,10 +328,12 @@
 			cacheNet.native(
 				Lampa.Utils.protocol() + ROOTU_CACHE_PATH + type + '/' + tmdbId + '.json',
 				function (list) {
+					log('trailer: кэш rootu —', list && list.length ? list.length + ' шт.' : 'пусто');
 					if (list && list.length) done(list);
 					else searchStep(0);
 				},
-				function () {
+				function (xhr) {
+					log('trailer: кэш rootu —', xhr && xhr.status === 404 ? 'нет записи' : 'недоступен, ' + errInfo(xhr));
 					searchStep(0);
 				}
 			);
@@ -319,16 +354,17 @@
 		var base = masterUrl.substring(0, masterUrl.lastIndexOf('/') + 1);
 		var called = false;
 
-		function finish(url) {
+		function finish(url, note) {
 			if (called) return;
 			called = true;
+			log('trailer: поток', note || '', url);
 			callback(url);
 		}
 
 		xhr.open('GET', masterUrl, true);
 		xhr.timeout = 10000;
 		xhr.onload = function () {
-			if (xhr.status !== 200) return finish(masterUrl);
+			if (xhr.status !== 200) return finish(masterUrl, '(master, плейлист вернул ' + xhr.status + ')');
 
 			var lines = String(xhr.responseText || '').split('\n');
 			var streams = [];
@@ -351,7 +387,7 @@
 				});
 			}
 
-			if (!streams.length) return finish(masterUrl);
+			if (!streams.length) return finish(masterUrl, '(master, вариантов нет)');
 
 			var fit = streams
 				.filter(function (s) {
@@ -361,16 +397,19 @@
 					return b.height - a.height || b.bandwidth - a.bandwidth;
 				});
 
-			if (fit.length) return finish(fit[0].url);
+			if (fit.length) return finish(fit[0].url, fit[0].height + 'p');
 
 			// всё выше потолка или без RESOLUTION — берём самый лёгкий
 			streams.sort(function (a, b) {
 				return (a.height || a.bandwidth) - (b.height || b.bandwidth);
 			});
-			finish(streams[0].url);
+			finish(streams[0].url, (streams[0].height || '?') + 'p');
 		};
-		xhr.onerror = xhr.ontimeout = function () {
-			finish(masterUrl);
+		xhr.onerror = function () {
+			finish(masterUrl, '(master, плейлист не прочитан — CORS/сеть)');
+		};
+		xhr.ontimeout = function () {
+			finish(masterUrl, '(master, таймаут плейлиста)');
 		};
 		xhr.send();
 
@@ -381,22 +420,36 @@
 		var net = new Lampa.Reguest();
 		var xhr = null;
 		var aborted = false;
+		var url = 'https://rutube.ru/api/play/options/' + videoId + '/?format=json&no_404=true';
 
-		net.timeout(10000);
-		net.native(
-			'https://rutube.ru/api/play/options/' + videoId + '/?format=json&no_404=true',
-			function (json) {
-				if (aborted) return;
-				var master = json && json.video_balancer && json.video_balancer.m3u8;
-				if (!master) return onFail();
-				xhr = pickVariant(master, function (url) {
-					if (!aborted) onSuccess(url);
-				});
-			},
-			function () {
-				if (!aborted) onFail();
-			}
-		);
+		function load(viaProxy) {
+			net.timeout(10000);
+			net.native(
+				(viaProxy ? searchProxy : '') + url,
+				function (json) {
+					if (aborted) return;
+					var master = json && json.video_balancer && json.video_balancer.m3u8;
+					if (!master) {
+						log('trailer: play/options', videoId, '— нет m3u8', json && json.detail ? json.detail : '');
+						return onFail();
+					}
+					xhr = pickVariant(master, function (streamUrl) {
+						if (!aborted) onSuccess(streamUrl);
+					});
+				},
+				function (xhr) {
+					if (aborted) return;
+					if (!viaProxy && isCorsBlocked(xhr)) {
+						useProxy();
+						return load(true);
+					}
+					log('trailer: play/options', videoId, (viaProxy ? 'через прокси ' : '') + '—', errInfo(xhr));
+					onFail();
+				}
+			);
+		}
+
+		load(false);
 
 		return function abort() {
 			aborted = true;
@@ -432,6 +485,17 @@
 		el.style.transform = transform;
 	}
 
+	// Как в плеере Lampa (HlsStream.shouldUseProgram): hls.js на Chrome > 120,
+	// по настройке «Программный» или когда встроенного HLS нет; Tizen/Orsay — встроенный
+	function preferHlsJs(nativeHls) {
+		var Hls = window.Hls;
+		if (!Hls || typeof Hls.isSupported !== 'function' || !Hls.isSupported()) return false;
+		if (Lampa.Platform.is('tizen') || Lampa.Platform.is('orsay')) return false;
+
+		var chrome = typeof Lampa.Platform.chromeVersion === 'function' ? Lampa.Platform.chromeVersion() : 0;
+		return Lampa.Storage.field('player_hls_method') === 'hlsjs' || chrome > 120 || !nativeHls;
+	}
+
 	function createBackgroundVideo(url, handlers) {
 		var html = $(
 			'<div class="cardify-trailer">' +
@@ -448,19 +512,70 @@
 		video.loop = true;
 		applyVideoLook(video);
 
-		function fail() {
+		var nativeHls = !!(video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl'));
+		var mode = '';
+
+		function fail(reason) {
 			if (dead) return;
+
+			// hls.js не смог (часто CORS на сегментах в браузере) — пробуем встроенный HLS
+			if (mode === 'hls.js' && !started && nativeHls) {
+				log('trailer: hls.js не смог (' + reason + '), пробую встроенный HLS');
+				attach('native');
+				return;
+			}
+
+			log('trailer: видео не играет —', reason, '(' + mode + ')');
 			var wasStarted = started;
 			destroy();
 			handlers.onError(wasStarted);
 		}
 
+		function attach(how) {
+			if (hls) {
+				try {
+					hls.destroy();
+				} catch (e) {}
+				hls = null;
+			}
+			mode = how;
+			log('trailer: проигрываю через', how);
+
+			if (how === 'hls.js') {
+				var Hls = window.Hls;
+				hls = new Hls({ maxBufferLength: 20, capLevelToPlayerSize: true });
+				hls.on(Hls.Events.ERROR, function (event, data) {
+					if (data && data.fatal) fail('hls.js: ' + data.type + ' / ' + data.details);
+				});
+				hls.loadSource(url);
+				hls.attachMedia(video);
+			} else {
+				video.src = url;
+			}
+
+			if (startTimer) {
+				// перезапуск ожидания старта для нового способа
+				clearTimeout(startTimer);
+				startTimer = null;
+				play();
+			}
+		}
+
 		function play() {
 			if (dead) return;
-			if (!started && !startTimer) startTimer = setTimeout(fail, TRAILER_START_TIMEOUT);
+			if (!started && !startTimer) {
+				startTimer = setTimeout(function () {
+					fail('не стартовало за ' + TRAILER_START_TIMEOUT / 1000 + ' с');
+				}, TRAILER_START_TIMEOUT);
+			}
 			try {
 				var p = video.play();
-				if (p && typeof p.catch === 'function') p.catch(noop);
+				if (p && typeof p.catch === 'function') {
+					p.catch(function (e) {
+						// AbortError — нормальный обрыв play() при паузе/смене источника
+						if (e && e.name !== 'AbortError') log('trailer: play() отклонён —', e.name, e.message);
+					});
+				}
 			} catch (e) {}
 		}
 
@@ -498,6 +613,7 @@
 			startTimer = null;
 			if (started || dead) return;
 			started = true;
+			log('trailer: играет (' + mode + ')', video.videoWidth + 'x' + video.videoHeight);
 			html.addClass('display');
 			handlers.onStart();
 		});
@@ -510,22 +626,13 @@
 			play();
 		});
 
-		video.addEventListener('error', fail);
+		video.addEventListener('error', function () {
+			if (mode !== 'native') return; // ошибки hls.js приходят через Hls.Events.ERROR
+			var err = video.error;
+			fail('media error ' + (err ? err.code + (err.message ? ' ' + err.message : '') : ''));
+		});
 
-		// Нативный HLS (Android WebView, Tizen, webOS) — легче для слабых приставок; иначе hls.js из Lampa
-		var Hls = window.Hls;
-		if (video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl')) {
-			video.src = url;
-		} else if (Hls && typeof Hls.isSupported === 'function' && Hls.isSupported()) {
-			hls = new Hls({ maxBufferLength: 20, capLevelToPlayerSize: true });
-			hls.on(Hls.Events.ERROR, function (event, data) {
-				if (data && data.fatal) fail();
-			});
-			hls.loadSource(url);
-			hls.attachMedia(video);
-		} else {
-			video.src = url;
-		}
+		attach(preferHlsJs(nativeHls) ? 'hls.js' : 'native');
 
 		return {
 			render: function () {
@@ -865,7 +972,9 @@
 
 		function fallback() {
 			if (destroyed) return;
-			if (isOn('cardify_run_slideshow')) startSlideshow();
+			var slideshow = isOn('cardify_run_slideshow');
+			log('trailer: не получилось —', slideshow ? 'включаю слайдшоу' : 'остаётся статичный фон');
+			if (slideshow) startSlideshow();
 		}
 
 		// --- трейлер ---
@@ -896,6 +1005,8 @@
 			var item = list[i] || {};
 			var id = rutubeId(item.video_url || item.embed_url || item.url);
 			if (!id) return tryCandidates(list, i + 1);
+
+			log('trailer: ролик ' + (i + 1) + '/' + list.length, '«' + item.title + '»', id);
 
 			abortStream = resolveStream(
 				id,
@@ -940,6 +1051,8 @@
 		}
 
 		var card = { activity: activity, sync: sync, destroy: destroy };
+
+		log('карточка:', movie ? movie.title || movie.name : '(нет данных)', '| трейлер:', isOn('cardify_trailers_bg'), '| слайдшоу:', isOn('cardify_run_slideshow'));
 
 		if (movie && isOn('cardify_trailers_bg')) startTrailer();
 		else if (movie && isOn('cardify_run_slideshow')) startSlideshow();
@@ -1134,7 +1247,9 @@
 	// ---------------------------------------------------------------------------
 
 	function startPlugin() {
-		if (!Lampa.Platform.screen('tv')) return console.log('Cardify', 'no tv');
+		if (!Lampa.Platform.screen('tv')) return log('экран не ТВ — плагин не запущен');
+
+		log('запущен', 'v' + VERSION, '| hls.js:', !!(window.Hls && window.Hls.isSupported && window.Hls.isSupported()), '| chrome:', typeof Lampa.Platform.chromeVersion === 'function' ? Lampa.Platform.chromeVersion() : '?');
 
 		addTranslations();
 		addTemplates();
